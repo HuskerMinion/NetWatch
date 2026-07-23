@@ -32,8 +32,7 @@ Pure Python 3 standard library — **nothing to install**.
 |---|---|
 | ![map](docs/NetWatch-Map.png) | ![alerts](docs/netwatch-alerts.png) |
 
-*The main view's left panel is a live world map (add a screenshot from your own
-deployment for the best hero image). Devices are color-coded with upload/download
+*The main view's left panel is a live world map. Devices are color-coded with upload/download
 totals and badges for threats or Pi-hole bypass; the alerts feed is severity-coded.*
 
 ---
@@ -92,7 +91,7 @@ second source port.
 
 ### 2. Enable port mirroring on the switch
 
-On TP-Link Omada, in the controller: **Devices → (your switch) → Ports →** click the
+On a TP-Link Omada switch, in the controller: **Devices → (your switch) → Ports →** click the
 monitor port → enable **Profile Overrides → Operation: Mirroring**, choose the
 source port(s), set direction **Both**, **Apply**. (Other managed switches have an
 equivalent "port mirror" / "SPAN" setting.)
