@@ -28,7 +28,7 @@ Pure Python 3 standard library — **nothing to install**.
 
 ## Screenshots
 
-| Devices & destinations | Alerts feed |
+| World Map | Alerts feed |
 |---|---|
 | ![map](docs/NetWatch-Map.png) | ![alerts](docs/netwatch-alerts.png) |
 
