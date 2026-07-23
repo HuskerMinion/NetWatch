@@ -108,6 +108,10 @@ CAP_STATE = {"iface": "", "pkts": 0, "pps": 0.0, "drops": 0, "error": None,
 START_TS = time.time()
 CONF = {}       # loaded from netwatch.conf (alert channels, pihole ip, etc.)
 PIHOLE_IPS = set()
+SNAP_CACHE = {"bytes": b'{"stats":{"active":0,"devices":0,"dests":0,'
+              b'"countries":0,"flagged":0,"alerts":0},"devices":[],"dests":[],'
+              b'"alerts":[],"home":null,"geo_state":"waiting","capture":{},'
+              b'"threat":{}}', "ts": 0}
 
 # LAN / private ranges (source side of an outbound flow)
 _PRIV = [ipaddress.ip_network(n) for n in (
@@ -1103,6 +1107,19 @@ def snapshot():
     }
 
 
+def snapshot_worker():
+    """Rebuild the /data payload once every ~1.5s so each HTTP request just
+    returns pre-serialized bytes. This keeps the server responsive no matter
+    how large the flow table gets or how many browsers/tabs are polling."""
+    while True:
+        try:
+            SNAP_CACHE["bytes"] = json.dumps(snapshot()).encode("utf-8")
+            SNAP_CACHE["ts"] = time.time()
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+
 # ----------------------------------------------------------------------------
 # HTTP server
 # ----------------------------------------------------------------------------
@@ -1114,7 +1131,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/" or u.path.startswith("/index"):
             body = HTML_PAGE.encode("utf-8"); ctype = "text/html; charset=utf-8"
         elif u.path == "/data":
-            body = json.dumps(snapshot()).encode("utf-8"); ctype = "application/json"
+            body = SNAP_CACHE["bytes"]; ctype = "application/json"
         elif u.path == "/history":
             q = parse_qs(u.query)
             hours = float(q.get("hours", ["24"])[0])
@@ -1633,6 +1650,7 @@ def main():
     threading.Thread(target=db_worker, daemon=True).start()
     threading.Thread(target=seen_writer, daemon=True).start()
     threading.Thread(target=alert_worker, daemon=True).start()
+    threading.Thread(target=snapshot_worker, daemon=True).start()
 
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
