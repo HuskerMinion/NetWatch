@@ -30,7 +30,7 @@ Pure Python 3 standard library — **nothing to install**.
 
 | Devices & destinations | Alerts feed |
 |---|---|
-| ![devices](docs/netwatch-map.png) | ![alerts](docs/netwatch-alerts.png) |
+| ![map](docs/NetWatch-Map.png) | ![alerts](docs/netwatch-alerts.png) |
 
 *The main view's left panel is a live world map (add a screenshot from your own
 deployment for the best hero image). Devices are color-coded with upload/download
