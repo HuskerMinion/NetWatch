@@ -1405,46 +1405,54 @@ function render(d){
   const msg=cap.error?null:tileBanner;
   if(msg){banner.textContent=msg;banner.style.display="block";}else banner.style.display="none";
 
-  if(HAS_MAP&&d.home&&!homeMarker){
-    homeLL=[d.home.lat,d.home.lon];
-    homeMarker=L.marker(homeLL,{icon:dotIcon("home",15),zIndexOffset:1000}).addTo(map)
-      .bindTooltip('<div class="tt-host">'+flag(d.home.countryCode)+" Your network</div>"
-        +'<div class="tt-ip">'+esc(d.home.city)+", "+esc(d.home.country)+"</div>",
-        {className:"nm",direction:"top",offset:[0,-8]});
-    map.setView(homeLL,3);
-  }
+  // Render the lists/stats FIRST — the map must never be able to block them.
+  renderList();
 
-  const seen=new Set();
-  if(HAS_MAP){
+  // Everything below draws on the map and is fully isolated: any Leaflet error
+  // (bad coords, a not-yet-sized container in a background tab, etc.) is caught
+  // so it can never leave the dashboard stuck on "Waiting for traffic".
+  if(!HAS_MAP||!map) return;
+  try{
+    if(d.home&&!homeMarker){
+      homeLL=[d.home.lat,d.home.lon];
+      homeMarker=L.marker(homeLL,{icon:dotIcon("home",15),zIndexOffset:1000}).addTo(map)
+        .bindTooltip('<div class="tt-host">'+flag(d.home.countryCode)+" Your network</div>"
+          +'<div class="tt-ip">'+esc(d.home.city)+", "+esc(d.home.country)+"</div>",
+          {className:"nm",direction:"top",offset:[0,-8]});
+      map.setView(homeLL,3);
+    }
+    const seen=new Set();
     for(const x of d.dests){
       if(!x.geo) continue;
-      const show=!selDev||x.devices.includes(selDev);
-      if(!show) continue;
-      seen.add(x.ip);
-      const ll=[x.geo.lat,x.geo.lon];
-      const bad=!!x.threat;
-      const color=bad?"#d03b3b":(selDev?colorFor(selDev):(x.devices.length===1?colorFor(x.devices[0]):BLUE));
-      const cls=(x.active?"active":"")+(bad?" bad":"");
-      const size=Math.min(9+Math.log2(1+(x.up+x.down)/500)*2.0,24);
-      let e=layers.get(x.ip);
-      if(!e){
-        const marker=L.marker(ll,{icon:dotIcon(cls,size,color),zIndexOffset:bad?800:0}).addTo(map)
-          .bindTooltip(destTip(x),{className:"nm",direction:"top",offset:[0,-8],sticky:true});
-        let arc=null;
-        if(homeLL) arc=L.polyline(arcPoints(homeLL,ll),{color:color,weight:bad?2:1.4,
-          opacity:bad?.8:(x.active?.55:.16),className:x.active?"nm-arc":"",interactive:false}).addTo(map);
-        e={marker,arc};layers.set(x.ip,e);
-      }else{
-        e.marker.setIcon(dotIcon(cls,size,color));
-        e.marker.setTooltipContent(destTip(x));
-        if(e.arc) e.arc.setStyle({color:color,weight:bad?2:1.4,opacity:bad?.8:(x.active?.55:.16),className:x.active?"nm-arc":""});
-      }
-      e.marker.setOpacity(x.active||bad?1:.4);
+      const la=+x.geo.lat, lo=+x.geo.lon;
+      if(!isFinite(la)||!isFinite(lo)) continue;
+      if(selDev&&!x.devices.includes(selDev)) continue;
+      try{
+        seen.add(x.ip);
+        const ll=[la,lo];
+        const bad=!!x.threat;
+        const color=bad?"#d03b3b":(selDev?colorFor(selDev):(x.devices.length===1?colorFor(x.devices[0]):BLUE));
+        const cls=(x.active?"active":"")+(bad?" bad":"");
+        const size=Math.min(9+Math.log2(1+(x.up+x.down)/500)*2.0,24);
+        let e=layers.get(x.ip);
+        if(!e){
+          const marker=L.marker(ll,{icon:dotIcon(cls,size,color),zIndexOffset:bad?800:0}).addTo(map)
+            .bindTooltip(destTip(x),{className:"nm",direction:"top",offset:[0,-8],sticky:true});
+          let arc=null;
+          if(homeLL) arc=L.polyline(arcPoints(homeLL,ll),{color:color,weight:bad?2:1.4,
+            opacity:bad?.8:(x.active?.55:.16),className:x.active?"nm-arc":"",interactive:false}).addTo(map);
+          e={marker,arc};layers.set(x.ip,e);
+        }else{
+          e.marker.setIcon(dotIcon(cls,size,color));
+          e.marker.setTooltipContent(destTip(x));
+          if(e.arc) e.arc.setStyle({color:color,weight:bad?2:1.4,opacity:bad?.8:(x.active?.55:.16),className:x.active?"nm-arc":""});
+        }
+        e.marker.setOpacity(x.active||bad?1:.4);
+      }catch(err){/* skip a single problematic marker, keep going */}
     }
-  }
-  for(const [ip,e] of layers){if(!seen.has(ip)){map.removeLayer(e.marker);
-    if(e.arc)map.removeLayer(e.arc);layers.delete(ip);}}
-  renderList();
+    for(const [ip,e] of layers){if(!seen.has(ip)){map.removeLayer(e.marker);
+      if(e.arc)map.removeLayer(e.arc);layers.delete(ip);}}
+  }catch(err){/* a map error must never block the dashboard */}
 }
 
 function bypassBadges(dv){
