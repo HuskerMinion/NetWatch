@@ -44,6 +44,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import webbrowser
 from email.message import EmailMessage
@@ -92,7 +93,7 @@ THREAT_SOURCES = {
     "spamhaus": "https://www.spamhaus.org/drop/drop.txt",
 }
 
-LOCK = threading.Lock()
+LOCK = threading.RLock()   # reentrant: a thread may re-acquire without deadlocking
 FLOWS = {}      # (dev,rem) -> {dev,rem,proto,ports:set,first,last,pkts,up,down,host}
 GEO = {}        # ip -> {status, ts, ...}
 DEV_NAMES = {}  # lan_ip -> hostname
@@ -112,6 +113,7 @@ SNAP_CACHE = {"bytes": b'{"stats":{"active":0,"devices":0,"dests":0,'
               b'"countries":0,"flagged":0,"alerts":0},"devices":[],"dests":[],'
               b'"alerts":[],"home":null,"geo_state":"waiting","capture":{},'
               b'"threat":{}}', "ts": 0}
+HEARTBEAT = {}   # worker name -> last-alive timestamp (for the watchdog)
 
 # LAN / private ranges (source side of an outbound flow)
 _PRIV = [ipaddress.ip_network(n) for n in (
@@ -454,6 +456,7 @@ def _capture_session(iface):
                     pass          # one bad packet must never stop capture
             now = time.time()
             if now - last_flush >= 1.0 or len(acc) > 4000:
+                _beat("capture")
                 flush()
                 dt = now - win_start
                 if dt >= 1:
@@ -598,6 +601,7 @@ def geo_worker():
     if HOME is None:
         geolocate_home()
     while True:
+        _beat("geo")
         now = time.time()
         with LOCK:
             pending = [ip for ip in {f["rem"] for f in FLOWS.values()}
@@ -805,19 +809,24 @@ def db_worker():
     last_prune = 0
     while True:
         time.sleep(DB_FLUSH_EVERY)
+        _beat("db")
         now = time.time()
+        # Snapshot the raw flow data under the lock, then do the expensive
+        # threat matching AFTER releasing it (threat_match takes the lock itself
+        # and iterates thousands of CIDRs — never hold LOCK across that).
         with LOCK:
-            rows = []
-            for f in FLOWS.values():
-                g = GEO.get(f["rem"])
-                gg = g if (g and g.get("status") == "ok") else {}
-                rows.append((f["dev"], DEV_NAMES.get(f["dev"], ""), f["rem"],
-                             f.get("host") or IPDOMAIN.get(f["rem"], ""),
-                             gg.get("country", ""), gg.get("countryCode", ""),
-                             f["first"], f["last"], f["up"], f["down"],
-                             threat_match(f["rem"]) or ""))
+            raw = [(f["dev"], DEV_NAMES.get(f["dev"], ""), f["rem"],
+                    f.get("host") or IPDOMAIN.get(f["rem"], ""),
+                    (GEO.get(f["rem"]) or {}), f["first"], f["last"],
+                    f["up"], f["down"]) for f in FLOWS.values()]
             pending = list(_alert_persist_q)
             _alert_persist_q.clear()
+        rows = []
+        for dev, name, rem, host, g, first, last, up, down in raw:
+            gg = g if g.get("status") == "ok" else {}
+            rows.append((dev, name, rem, host, gg.get("country", ""),
+                         gg.get("countryCode", ""), first, last, up, down,
+                         threat_match(rem) or ""))
         try:
             # Keep one row per (dev,rem,first) session, updated in place.
             for r in rows:
@@ -887,6 +896,7 @@ def alert_worker():
     while True:
         time.sleep(4)
         try:
+            _beat("alert")
             _alert_pass(warmup)
         except Exception:
             pass          # never let alert evaluation kill its own thread
@@ -1128,12 +1138,44 @@ def snapshot():
     }
 
 
+def _beat(name):
+    HEARTBEAT[name] = time.time()
+
+
+def watchdog():
+    """Every 8s log the liveness of each worker. If the dashboard snapshot stops
+    advancing (the freeze the user sees), dump every thread's stack so we can see
+    exactly where it is stuck. Watch live with: journalctl -u netwatch -f"""
+    dumped = False
+    while True:
+        time.sleep(8)
+        now = time.time()
+        snap_age = now - SNAP_CACHE.get("ts", 0)
+        if snap_age > 5:            # only speak up when something is lagging
+            ages = {n: round(now - t, 1) for n, t in list(HEARTBEAT.items())}
+            print("HEARTBEAT worker-ages(s)=%s snapshot-age=%.1f" % (ages, snap_age),
+                  flush=True)
+        if snap_age > 12 and not dumped:
+            dumped = True
+            print("=" * 60, flush=True)
+            print("WATCHDOG: dashboard FROZEN (snapshot stale %.1fs). "
+                  "Thread stacks follow:" % snap_age, flush=True)
+            names = {t.ident: t.name for t in threading.enumerate()}
+            for ident, frame in sys._current_frames().items():
+                print("--- thread: %s ---" % names.get(ident, ident), flush=True)
+                print("".join(traceback.format_stack(frame)), flush=True)
+            print("=" * 60, flush=True)
+        elif snap_age <= 12:
+            dumped = False
+
+
 def snapshot_worker():
     """Rebuild the /data payload once every ~1.5s so each HTTP request just
     returns pre-serialized bytes. This keeps the server responsive no matter
     how large the flow table gets or how many browsers/tabs are polling."""
     while True:
         try:
+            _beat("snapshot")
             _prune(time.time())     # backstop: clears stale flows regardless of capture
             SNAP_CACHE["bytes"] = json.dumps(snapshot()).encode("utf-8")
             SNAP_CACHE["ts"] = time.time()
@@ -1659,20 +1701,21 @@ def main():
 
     if args.demo:
         print("  DEMO mode - synthesizing traffic, no capture")
-        threading.Thread(target=demo_loop, daemon=True).start()
+        threading.Thread(target=demo_loop, name="demo", daemon=True).start()
     else:
         if os.name != "posix":
             sys.exit("Capture mode requires Linux. Use --demo to preview the UI.")
         print("  capturing on %s (needs root)" % args.iface)
         threading.Thread(target=capture_loop, args=(args.iface,),
-                         daemon=True).start()
-        threading.Thread(target=name_worker, daemon=True).start()
-    threading.Thread(target=geo_worker, daemon=True).start()
-    threading.Thread(target=threat_worker, daemon=True).start()
-    threading.Thread(target=db_worker, daemon=True).start()
-    threading.Thread(target=seen_writer, daemon=True).start()
-    threading.Thread(target=alert_worker, daemon=True).start()
-    threading.Thread(target=snapshot_worker, daemon=True).start()
+                         name="capture", daemon=True).start()
+        threading.Thread(target=name_worker, name="name", daemon=True).start()
+    threading.Thread(target=geo_worker, name="geo", daemon=True).start()
+    threading.Thread(target=threat_worker, name="threat", daemon=True).start()
+    threading.Thread(target=db_worker, name="db", daemon=True).start()
+    threading.Thread(target=seen_writer, name="seen", daemon=True).start()
+    threading.Thread(target=alert_worker, name="alert", daemon=True).start()
+    threading.Thread(target=snapshot_worker, name="snapshot", daemon=True).start()
+    threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
 
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
