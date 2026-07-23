@@ -108,6 +108,10 @@ CAP_STATE = {"iface": "", "pkts": 0, "pps": 0.0, "drops": 0, "error": None,
 START_TS = time.time()
 CONF = {}       # loaded from netwatch.conf (alert channels, pihole ip, etc.)
 PIHOLE_IPS = set()
+SNAP_CACHE = {"bytes": b'{"stats":{"active":0,"devices":0,"dests":0,'
+              b'"countries":0,"flagged":0,"alerts":0},"devices":[],"dests":[],'
+              b'"alerts":[],"home":null,"geo_state":"waiting","capture":{},'
+              b'"threat":{}}', "ts": 0}
 
 # LAN / private ranges (source side of an outbound flow)
 _PRIV = [ipaddress.ip_network(n) for n in (
@@ -335,126 +339,139 @@ def _mark_bypass(dev, kind, detail):
 
 
 def capture_loop(iface):
-    try:
-        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
-                          socket.htons(0x0003))
+    """Supervisor: runs a capture session and, if it ever dies for any reason,
+    re-opens the socket and starts again — so a fluke never leaves the dashboard
+    frozen waiting for a manual restart."""
+    while True:
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
-        except OSError:
-            pass
-        s.bind((iface, 0))
-        # Enable promiscuous mode so the NIC accepts mirrored frames that are
-        # not addressed to its own MAC (essential on a mirror/monitor port).
-        try:
-            SOL_PACKET, ADD_MEMBERSHIP, MR_PROMISC = 263, 1, 1
-            idx = socket.if_nametoindex(iface)
-            mreq = struct.pack("iHH8s", idx, MR_PROMISC, 0, b"")
-            s.setsockopt(SOL_PACKET, ADD_MEMBERSHIP, mreq)
-        except OSError as e:
-            print("  warning: could not enable promiscuous mode (%s); "
-                  "you may only see this box's own traffic" % e)
-    except PermissionError:
-        CAP_STATE["error"] = "permission denied (run with sudo)"
-        return
-    except OSError as e:
-        CAP_STATE["error"] = "cannot open %s: %s" % (iface, e)
-        return
+            _capture_session(iface)
+        except PermissionError:
+            CAP_STATE["error"] = "permission denied (run with sudo)"
+            return                                 # never going to succeed
+        except Exception as e:
+            CAP_STATE["error"] = "capture restarting (%s)" % type(e).__name__
+        else:
+            CAP_STATE["error"] = "capture ended, restarting"
+        time.sleep(3)
 
+
+def _handle_packet(buf, n, acc, dns_new, bypass_new):
+    """Process one captured frame into the local accumulators. Callers wrap this
+    so a single malformed packet can never kill the capture thread."""
+    pk = parse_frame(buf, n)
+    if not pk:
+        return
+    now = time.time()
+    if pk["sport"] == 53:                          # a DNS response
+        for ip, qname in parse_dns_answers(buf, n, pk["payload"]):
+            try:
+                if ipaddress.ip_address(ip).is_global and qname:
+                    dns_new[ip] = qname.lower().rstrip(".")
+            except ValueError:
+                pass
+    elif pk["dport"] == 53:                        # a DNS query
+        try:
+            sa = ipaddress.ip_address(pk["src"])
+            da = ipaddress.ip_address(pk["dst"])
+            if is_private_lan(sa) and da.is_global and pk["dst"] not in PIHOLE_IPS:
+                bypass_new.append((pk["src"], "plaintext-dns", pk["dst"]))
+        except ValueError:
+            pass
+
+    c = classify(pk["src"], pk["dst"])
+    if not c:
+        return
+    dev, rem, direction = c
+    port = pk["dport"] if direction == "out" else pk["sport"]
+    host = None
+    if (direction == "out" and pk["proto"] == "tcp" and pk["dport"] == 443
+            and pk["payload"] < n and buf[pk["payload"]] == 0x16):
+        host = parse_sni(buf, n, pk["payload"])
+    if rem in DOH_IPS or (host and host.lower() in DOH_HOSTS):
+        bypass_new.append((dev, "doh", host or rem))
+    e = acc.get((dev, rem))
+    if e is None:
+        e = {"proto": pk["proto"], "ports": {port}, "pkts": 0,
+             "up": 0, "down": 0, "host": host, "last": now}
+        acc[(dev, rem)] = e
+    e["pkts"] += 1
+    e["ports"].add(port)
+    if direction == "out":
+        e["up"] += pk["plen"]
+    else:
+        e["down"] += pk["plen"]
+    if pk["proto"] == "tcp":
+        e["proto"] = "tcp"
+    if host and not e["host"]:
+        e["host"] = host
+
+
+def _capture_session(iface):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+    except OSError:
+        pass
+    s.bind((iface, 0))
+    try:                    # promiscuous mode: accept mirrored frames
+        idx = socket.if_nametoindex(iface)
+        mreq = struct.pack("iHH8s", idx, 1, 0, b"")   # ifindex, MR_PROMISC
+        s.setsockopt(263, 1, mreq)                    # SOL_PACKET, ADD_MEMBERSHIP
+    except OSError as e:
+        print("  warning: could not enable promiscuous mode (%s)" % e)
+    s.settimeout(1.0)       # wake at least once a second for housekeeping
     CAP_STATE["iface"] = iface
     CAP_STATE["error"] = None
-    buf = bytearray(CAP_BYTES)
-    acc = {}                      # local accumulator flushed under lock
-    dns_new = {}                  # ip -> domain, learned this window
-    bypass_new = []               # (dev, kind, detail)
-    count = 0
-    win_start = time.time()
-    win_count = 0
-    last_flush = win_start
 
-    def flush(now):
+    buf = bytearray(CAP_BYTES)
+    acc, dns_new, bypass_new = {}, {}, []
+    count = win_count = 0
+    win_start = last_flush = time.time()
+
+    def flush():
         if acc or dns_new or bypass_new:
             with LOCK:
                 for k, e in acc.items():
                     _merge_flow(k, e, e["last"])
                 for ip, dom in dns_new.items():
-                    if ip not in IPDOMAIN:
-                        IPDOMAIN[ip] = dom
+                    IPDOMAIN.setdefault(ip, dom)
                 for dev, kind, detail in bypass_new:
                     _mark_bypass(dev, kind, detail)
             acc.clear(); dns_new.clear(); bypass_new.clear()
 
-    while True:
-        try:
-            n = s.recv_into(buf, CAP_BYTES)
-        except OSError:
-            continue
-        count += 1
-        win_count += 1
-        pk = parse_frame(buf, n)
-        if not pk:
-            pass
-        else:
-            now = time.time()
-            # --- DNS learning + plaintext-DNS bypass ---
-            if pk["sport"] == 53:                      # a DNS response
-                for ip, qname in parse_dns_answers(buf, n, pk["payload"]):
-                    try:
-                        if ipaddress.ip_address(ip).is_global and qname:
-                            dns_new[ip] = qname.lower().rstrip(".")
-                    except ValueError:
-                        pass
-            elif pk["dport"] == 53:                    # a DNS query
+    try:
+        while True:
+            try:
+                n = s.recv_into(buf, CAP_BYTES)
+            except (socket.timeout, OSError):
+                n = 0
+            if n:
+                count += 1
+                win_count += 1
                 try:
-                    sa = ipaddress.ip_address(pk["src"])
-                    da = ipaddress.ip_address(pk["dst"])
-                    if is_private_lan(sa) and (da.is_global
-                            and pk["dst"] not in PIHOLE_IPS):
-                        bypass_new.append((pk["src"], "plaintext-dns", pk["dst"]))
-                except ValueError:
+                    _handle_packet(buf, n, acc, dns_new, bypass_new)
+                except Exception:
+                    pass          # one bad packet must never stop capture
+            now = time.time()
+            if now - last_flush >= 1.0 or len(acc) > 4000:
+                flush()
+                dt = now - win_start
+                if dt >= 1:
+                    CAP_STATE["pps"] = round(win_count / dt, 1)
+                    win_start, win_count = now, 0
+                CAP_STATE["pkts"] = count
+                last_flush = now
+                try:
+                    st = s.getsockopt(263, 6, 8)   # SOL_PACKET, PACKET_STATISTICS
+                    CAP_STATE["drops"] += struct.unpack("II", st)[1]
+                except Exception:
                     pass
-
-            c = classify(pk["src"], pk["dst"])
-            if c:
-                dev, rem, direction = c
-                port = pk["dport"] if direction == "out" else pk["sport"]
-                host = None
-                if (direction == "out" and pk["proto"] == "tcp"
-                        and pk["dport"] == 443 and pk["payload"] < n
-                        and buf[pk["payload"]] == 0x16):
-                    host = parse_sni(buf, n, pk["payload"])
-                if rem in DOH_IPS or (host and host.lower() in DOH_HOSTS):
-                    bypass_new.append((dev, "doh", host or rem))
-                e = acc.get((dev, rem))
-                if e is None:
-                    e = {"proto": pk["proto"], "ports": {port}, "pkts": 0,
-                         "up": 0, "down": 0, "host": host, "last": now}
-                    acc[(dev, rem)] = e
-                e["pkts"] += 1
-                e["ports"].add(port)
-                if direction == "out":
-                    e["up"] += pk["plen"]
-                else:
-                    e["down"] += pk["plen"]
-                if pk["proto"] == "tcp":
-                    e["proto"] = "tcp"
-                if host and not e["host"]:
-                    e["host"] = host
-
-        now = time.time()
-        if count % 2000 == 0 or now - last_flush > 1.0 or len(acc) > 4000:
-            flush(now)
-            last_flush = now
-            dt = now - win_start
-            if dt >= 1:
-                CAP_STATE["pps"] = round(win_count / dt, 1)
-                win_start, win_count = now, 0
-            CAP_STATE["pkts"] = count
-            try:                       # kernel drop counter (PACKET_STATISTICS)
-                st = s.getsockopt(263, 6, 8)   # SOL_PACKET, PACKET_STATISTICS
-                CAP_STATE["drops"] = struct.unpack("II", st)[1]
-            except Exception:
-                pass
-            _prune(now)
+                _prune(now)
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def _prune(now):
@@ -869,13 +886,21 @@ def alert_worker():
     warmup = float(CONF.get("learn_minutes", 15)) * 60
     while True:
         time.sleep(4)
-        now = time.time()
-        learning = (now - START_TS) < warmup
-        with LOCK:
-            flows = list(FLOWS.values())
-            geo = dict(GEO)
-            names = dict(DEV_NAMES)
-            bypass = {d: dict(v, types=set(v["types"])) for d, v in BYPASS.items()}
+        try:
+            _alert_pass(warmup)
+        except Exception:
+            pass          # never let alert evaluation kill its own thread
+
+
+def _alert_pass(warmup):
+    now = time.time()
+    learning = (now - START_TS) < warmup
+    with LOCK:
+        flows = list(FLOWS.values())
+        geo = dict(GEO)
+        names = dict(DEV_NAMES)
+        bypass = {d: dict(v, types=set(v["types"])) for d, v in BYPASS.items()}
+    if True:
         for f in flows:
             dev, rem = f["dev"], f["rem"]
             host = f.get("host") or IPDOMAIN.get(rem, "")
@@ -1103,6 +1128,20 @@ def snapshot():
     }
 
 
+def snapshot_worker():
+    """Rebuild the /data payload once every ~1.5s so each HTTP request just
+    returns pre-serialized bytes. This keeps the server responsive no matter
+    how large the flow table gets or how many browsers/tabs are polling."""
+    while True:
+        try:
+            _prune(time.time())     # backstop: clears stale flows regardless of capture
+            SNAP_CACHE["bytes"] = json.dumps(snapshot()).encode("utf-8")
+            SNAP_CACHE["ts"] = time.time()
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+
 # ----------------------------------------------------------------------------
 # HTTP server
 # ----------------------------------------------------------------------------
@@ -1114,7 +1153,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/" or u.path.startswith("/index"):
             body = HTML_PAGE.encode("utf-8"); ctype = "text/html; charset=utf-8"
         elif u.path == "/data":
-            body = json.dumps(snapshot()).encode("utf-8"); ctype = "application/json"
+            body = SNAP_CACHE["bytes"]; ctype = "application/json"
         elif u.path == "/history":
             q = parse_qs(u.query)
             hours = float(q.get("hours", ["24"])[0])
@@ -1633,6 +1672,7 @@ def main():
     threading.Thread(target=db_worker, daemon=True).start()
     threading.Thread(target=seen_writer, daemon=True).start()
     threading.Thread(target=alert_worker, daemon=True).start()
+    threading.Thread(target=snapshot_worker, daemon=True).start()
 
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
