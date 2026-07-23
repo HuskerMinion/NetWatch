@@ -1,0 +1,18 @@
+[Unit]
+Description=NetWatch - network-wide connection map (mirror-port sniffer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the path below to wherever you put netwatch.py:
+ExecStart=/usr/bin/python3 /opt/netwatch/netwatch.py --iface eth0 --port 8339 --host 0.0.0.0 --no-browser
+WorkingDirectory=/opt/netwatch
+Restart=always
+RestartSec=5
+# Raw packet capture requires elevated privileges:
+User=root
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

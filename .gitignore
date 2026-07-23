@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# NetWatch runtime state (generated at run time — do not commit)
+netwatch.db
+netwatch.db-wal
+netwatch.db-shm
+netwatch_geo_cache.json
+netwatch_threat_cache.json
+
+# Your local config may contain notification credentials — never commit it
+netwatch.conf
