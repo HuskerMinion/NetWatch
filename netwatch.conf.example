@@ -13,6 +13,9 @@
   "alert_new_dest": false,
   "_alert_new_dest": "If true, also alert on every brand-new destination IP/host per device. Off by default because CDNs rotate IPs constantly and this gets noisy. New-country, threat, and bypass alerts are always on.",
 
+  "weekly_digest": false,
+  "_weekly_digest": "If true (and email is configured below), emails a weekly summary - top talkers, countries, alert counts, and threat hits from the past 7 days. The first digest arrives one week after enabling.",
+
   "notify": {
     "_comment": "Remove any channel you don't want. In-app alerts (the bell) always work regardless of these.",
 

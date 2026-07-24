@@ -65,6 +65,11 @@ CACHE_FILE = os.path.join(HERE, "netwatch_geo_cache.json")
 DB_FILE = os.path.join(HERE, "netwatch.db")
 CONF_FILE = os.path.join(HERE, "netwatch.conf")
 THREAT_CACHE = os.path.join(HERE, "netwatch_threat_cache.json")
+OUI_CACHE = os.path.join(HERE, "netwatch_oui_cache.json")
+OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
+OUI_REFRESH = 30 * 86400
+DIGEST_INTERVAL = 7 * 86400
+DIGEST_STATE = os.path.join(HERE, "netwatch_digest.json")
 
 STALE_AFTER = 10       # seconds since last packet -> flow shown as fading
 DROP_AFTER = 120       # seconds since last packet -> flow removed
@@ -102,6 +107,10 @@ BYPASS = {}     # dev_ip -> {"type": set(), "last": ts, "detail": str}
 SEEN = {"dev_country": set(), "dev_rem": set()}   # baselines loaded from DB
 ALERTS = []     # recent alert dicts (also persisted)
 THREAT = {"exact": set(), "nets": [], "loaded": 0, "ts": 0, "error": None}
+DEV_MAC = {}    # lan_ip -> MAC string (from sniffed Ethernet headers)
+OUI = {}        # 6-hex OUI prefix -> vendor name
+OUI_STATE = {"loaded": 0}
+INBOUND = {}    # (dev, rem) -> {dev, rem, ports:set, first, last, count}
 HOME = None
 GEO_STATE = "waiting"
 CAP_STATE = {"iface": "", "pkts": 0, "pps": 0.0, "drops": 0, "error": None,
@@ -341,6 +350,34 @@ def _mark_bypass(dev, kind, detail):
     b["detail"] = detail
 
 
+def _record_inbound(dev, rem, dport):
+    now = time.time()
+    key = (dev, rem)
+    e = INBOUND.get(key)
+    if e is None:
+        INBOUND[key] = {"dev": dev, "rem": rem, "ports": {dport},
+                        "first": now, "last": now, "count": 1}
+    else:
+        e["ports"].add(dport)
+        e["last"] = now
+        e["count"] += 1
+
+
+def mac_vendor(dev):
+    """Vendor name for a device from its MAC OUI, or '' if unknown/randomized."""
+    mac = DEV_MAC.get(dev)
+    if not mac:
+        return ""
+    try:
+        first = int(mac[0:2], 16)
+    except ValueError:
+        return ""
+    if first & 0x02:                 # locally-administered / randomized MAC
+        return ""
+    oui = mac.replace(":", "")[:6].upper()
+    return OUI.get(oui, "")
+
+
 def capture_loop(iface):
     """Supervisor: runs a capture session and, if it ever dies for any reason,
     re-opens the socket and starts again — so a fluke never leaves the dashboard
@@ -358,7 +395,7 @@ def capture_loop(iface):
         time.sleep(3)
 
 
-def _handle_packet(buf, n, acc, dns_new, bypass_new):
+def _handle_packet(buf, n, acc, dns_new, bypass_new, mac_new, inbound_new):
     """Process one captured frame into the local accumulators. Callers wrap this
     so a single malformed packet can never kill the capture thread."""
     pk = parse_frame(buf, n)
@@ -389,6 +426,18 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new):
     dev, rem, direction = c
     if dev in IGNORE:      # excluded device: not listed, mapped, flagged or alerted
         return
+
+    # Unsolicited inbound: a TCP SYN (no ACK) arriving FROM the internet TO a LAN
+    # device is someone opening a connection to us (a scan or a hit on a
+    # forwarded service), not our own outbound traffic.
+    if direction == "in" and pk["proto"] == "tcp" and (pk["flags"] & 0x12) == 0x02:
+        inbound_new.append((dev, rem, pk["dport"]))
+
+    # Learn the device's MAC from the source of its outbound frames (src MAC is
+    # the LAN device's own hardware address on the wire).
+    if direction == "out" and dev not in DEV_MAC and dev not in mac_new:
+        mac_new[dev] = "%02x:%02x:%02x:%02x:%02x:%02x" % tuple(buf[6:12])
+
     port = pk["dport"] if direction == "out" else pk["sport"]
     host = None
     if (direction == "out" and pk["proto"] == "tcp" and pk["dport"] == 443
@@ -431,12 +480,12 @@ def _capture_session(iface):
     CAP_STATE["error"] = None
 
     buf = bytearray(CAP_BYTES)
-    acc, dns_new, bypass_new = {}, {}, []
+    acc, dns_new, bypass_new, mac_new, inbound_new = {}, {}, [], {}, []
     count = win_count = 0
     win_start = last_flush = time.time()
 
     def flush():
-        if acc or dns_new or bypass_new:
+        if acc or dns_new or bypass_new or mac_new or inbound_new:
             with LOCK:
                 for k, e in acc.items():
                     _merge_flow(k, e, e["last"])
@@ -444,7 +493,12 @@ def _capture_session(iface):
                     IPDOMAIN.setdefault(ip, dom)
                 for dev, kind, detail in bypass_new:
                     _mark_bypass(dev, kind, detail)
+                for dev, mac in mac_new.items():
+                    DEV_MAC.setdefault(dev, mac)
+                for dev, rem, dport in inbound_new:
+                    _record_inbound(dev, rem, dport)
             acc.clear(); dns_new.clear(); bypass_new.clear()
+            mac_new.clear(); inbound_new.clear()
 
     try:
         while True:
@@ -456,7 +510,8 @@ def _capture_session(iface):
                 count += 1
                 win_count += 1
                 try:
-                    _handle_packet(buf, n, acc, dns_new, bypass_new)
+                    _handle_packet(buf, n, acc, dns_new, bypass_new,
+                                   mac_new, inbound_new)
                 except Exception:
                     pass          # one bad packet must never stop capture
             now = time.time()
@@ -486,6 +541,8 @@ def _prune(now):
     with LOCK:
         for k in [k for k, f in FLOWS.items() if now - f["last"] > DROP_AFTER]:
             del FLOWS[k]
+        for k in [k for k, v in INBOUND.items() if now - v["last"] > DROP_AFTER]:
+            del INBOUND[k]
 
 
 # ----------------------------------------------------------------------------
@@ -498,8 +555,8 @@ def demo_loop():
     devices = ["192.168.1.20", "192.168.1.31", "192.168.1.44", "192.168.1.57",
                "192.168.1.66"]
     dnames = {"192.168.1.20": "terry-pc", "192.168.1.31": "living-room-tv",
-              "192.168.1.44": "pixel-phone", "192.168.1.57": "ring-doorbell",
-              "192.168.1.66": "echo-dot"}
+              "192.168.1.44": "pixel-phone", "192.168.1.57": "ring-doorbell"}
+    # 192.168.1.66 intentionally has no hostname -> named by MAC vendor instead
     remotes = [
         ("8.8.8.8", "dns.google", 443), ("140.82.113.3", "github.com", 443),
         ("104.16.132.229", "cloudflare.com", 443),
@@ -514,6 +571,12 @@ def demo_loop():
         # Demo a threat hit and a DNS-bypass so those features are visible.
         THREAT["exact"].add("77.88.8.8"); THREAT["loaded"] = 1
         THREAT["ts"] = START_TS
+        # MAC vendor demo: the un-named device resolves to a vendor name
+        DEV_MAC["192.168.1.66"] = "44:07:0b:11:22:33"
+        OUI["44070B"] = "Amazon Technologies"; OUI_STATE["loaded"] = 1
+        # An unsolicited inbound connection attempt (e.g. hitting a forwarded port)
+        _record_inbound("192.168.1.20", "185.220.101.5", 22)
+        _record_inbound("192.168.1.20", "185.220.101.5", 22)
     i = 0
     # deterministic pseudo-random without Math.random/time-seed issues
     while True:
@@ -740,6 +803,48 @@ def threat_worker():
         time.sleep(THREAT_REFRESH)
 
 
+def oui_worker():
+    """Download and cache the IEEE OUI list so unknown devices can be named by
+    their hardware vendor (e.g. 'Espressif', 'Amazon Technologies')."""
+    try:                                    # instant start from disk cache
+        with open(OUI_CACHE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with LOCK:
+            OUI.update(data)
+            OUI_STATE["loaded"] = len(OUI)
+    except Exception:
+        pass
+    while True:
+        if OUI_STATE["loaded"] == 0:
+            try:
+                text = _http_text(OUI_URL, timeout=60)
+                table = {}
+                for line in text.splitlines():
+                    # CSV: Registry,Assignment(6 hex),Organization Name,Address
+                    parts = line.split(",", 3)
+                    if len(parts) >= 3 and len(parts[1]) == 6:
+                        try:
+                            int(parts[1], 16)
+                        except ValueError:
+                            continue
+                        vendor = parts[2].strip().strip('"')
+                        if vendor:
+                            table[parts[1].upper()] = vendor[:40]
+                if table:
+                    with LOCK:
+                        OUI.clear(); OUI.update(table)
+                        OUI_STATE["loaded"] = len(OUI)
+                    try:
+                        with open(OUI_CACHE, "w", encoding="utf-8") as f:
+                            json.dump(table, f)
+                    except Exception:
+                        pass
+                    print("  loaded %d MAC vendor prefixes" % len(table))
+            except Exception:
+                pass
+        time.sleep(OUI_REFRESH)
+
+
 _threat_verdict = {}     # ip -> list-name or "" (memoised)
 
 
@@ -916,7 +1021,15 @@ def _alert_pass(warmup):
         geo = dict(GEO)
         names = dict(DEV_NAMES)
         bypass = {d: dict(v, types=set(v["types"])) for d, v in BYPASS.items()}
+        inbound = [(v["dev"], v["rem"], sorted(v["ports"])[0] if v["ports"] else 0)
+                   for v in INBOUND.values()]
     if True:
+        # unsolicited inbound connection attempts (someone connecting TO us)
+        for dev, rem, port in inbound:
+            th = threat_match(rem)
+            _fire("inbound", dev, rem, "", None, names, learning=False,
+                  msg="unsolicited inbound connection from %s to port %d%s"
+                      % (rem, port, " [ON THREAT LIST]" if th else ""))
         for f in flows:
             dev, rem = f["dev"], f["rem"]
             host = f.get("host") or IPDOMAIN.get(rem, "")
@@ -966,6 +1079,8 @@ def _fire(kind, dev, key, host, cc, names, learning, msg):
         level = "notice"
     elif kind == "threat":
         level, rem_field = "critical", key
+    elif kind == "inbound":
+        level, rem_field = "warning", key
     elif kind.startswith("bypass_"):
         if learning:
             return
@@ -1048,6 +1163,105 @@ def notify(a):
         pass
 
 
+def _send_email(subject, body):
+    em = (CONF.get("notify") or {}).get("email")
+    if not em:
+        return False
+    msg = EmailMessage()
+    msg["From"] = em["from"]
+    msg["To"] = em["to"]
+    msg["Subject"] = subject
+    msg.set_content(body)
+    with smtplib.SMTP(em["smtp_host"], int(em.get("smtp_port", 587)), timeout=20) as s:
+        s.starttls()
+        if em.get("username"):
+            s.login(em["username"], em["password"])
+        s.send_message(msg)
+    return True
+
+
+def _fmt_bytes(b):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return "%.1f %s" % (b, unit)
+        b /= 1024
+    return "%.1f PB" % b
+
+
+def build_digest():
+    since = time.time() - DIGEST_INTERVAL
+    con = db_connect()
+    sess = con.execute("SELECT dev,dev_name,rem,host,cc,country,up,down,threat "
+                       "FROM sessions WHERE last>=?", (since,)).fetchall()
+    alerts = con.execute("SELECT kind,level,ts FROM alerts WHERE ts>=?",
+                         (since,)).fetchall()
+    con.close()
+    dev_bytes, countries, dests, threats = {}, set(), set(), []
+    total = 0
+    for dev, dname, rem, host, cc, country, up, down, threat in sess:
+        vol = (up or 0) + (down or 0)
+        total += vol
+        dev_bytes[dev] = dev_bytes.get(dev, [dname, 0])
+        dev_bytes[dev][0] = dname or dev_bytes[dev][0]
+        dev_bytes[dev][1] += vol
+        if cc:
+            countries.add(cc)
+        dests.add(rem)
+        if threat:
+            threats.append("%s -> %s (%s)" % (dname or dev, host or rem, country or cc))
+    akinds = {}
+    for kind, level, ts in alerts:
+        akinds[kind] = akinds.get(kind, 0) + 1
+
+    L = ["NetWatch weekly digest", "=" * 40, ""]
+    L.append("Total traffic seen: %s across %d devices, %d destinations, %d countries."
+             % (_fmt_bytes(total), len(dev_bytes), len(dests), len(countries)))
+    L.append("")
+    L.append("Top talkers (by data volume):")
+    for dev, (dname, vol) in sorted(dev_bytes.items(), key=lambda x: -x[1][1])[:10]:
+        L.append("  %-22s %s" % (dname or dev, _fmt_bytes(vol)))
+    L.append("")
+    L.append("Alerts this week: %d total" % len(alerts))
+    for kind, cnt in sorted(akinds.items(), key=lambda x: -x[1]):
+        L.append("  %-18s %d" % (kind.replace("_", " "), cnt))
+    if threats:
+        L.append("")
+        L.append("Threat-list hits (%d):" % len(threats))
+        for t in threats[:15]:
+            L.append("  " + t)
+    L.append("")
+    L.append("- NetWatch")
+    return "\n".join(L)
+
+
+def digest_worker():
+    def last_sent():
+        try:
+            return json.load(open(DIGEST_STATE))["last"]
+        except Exception:
+            return 0
+    # seed the clock on first run so the first digest fires a week from now
+    if last_sent() == 0:
+        try:
+            json.dump({"last": time.time()}, open(DIGEST_STATE, "w"))
+        except Exception:
+            pass
+    while True:
+        time.sleep(3600)
+        try:
+            if not CONF.get("weekly_digest"):
+                continue
+            if not (CONF.get("notify") or {}).get("email"):
+                continue
+            if time.time() - last_sent() < DIGEST_INTERVAL:
+                continue
+            if _send_email("NetWatch weekly digest", build_digest()):
+                json.dump({"last": time.time()}, open(DIGEST_STATE, "w"))
+                print("  weekly digest emailed", flush=True)
+        except Exception as e:
+            print("  digest error: %s" % e, flush=True)
+
+
 # ----------------------------------------------------------------------------
 # Snapshot for the web UI
 # ----------------------------------------------------------------------------
@@ -1063,6 +1277,8 @@ def snapshot():
         alerts = ALERTS[-60:][::-1]
         threat_stat = {"loaded": THREAT["loaded"], "ts": THREAT["ts"],
                        "error": THREAT["error"]}
+        vendors = {d: mac_vendor(d) for d in {f["dev"] for f in flows}}
+        inbound_raw = [dict(v, ports=sorted(v["ports"])[:6]) for v in INBOUND.values()]
 
     dests = {}
     devices = {}
@@ -1097,7 +1313,8 @@ def snapshot():
         d["last"] = max(d["last"], f["last"])
 
         dv = devices.setdefault(f["dev"], {
-            "ip": f["dev"], "name": names.get(f["dev"]) or "", "dests": set(),
+            "ip": f["dev"], "name": names.get(f["dev"]) or "",
+            "vendor": vendors.get(f["dev"], ""), "dests": set(),
             "pkts": 0, "up": 0, "down": 0, "active": False, "last": f["last"],
             "bypass": bypass.get(f["dev"], []), "threats": 0})
         dv["dests"].add(f["rem"])
@@ -1130,6 +1347,31 @@ def snapshot():
     dev_list.sort(key=lambda d: (-(d["threats"] > 0), -bool(d["bypass"]),
                                  -d["active"], -d["ndest"], d["ip"]))
 
+    # Inbound connection attempts, enriched with location + threat
+    inbound = []
+    for v in inbound_raw:
+        g = geo.get(v["rem"])
+        gg = g if (g and g.get("status") == "ok") else {}
+        inbound.append({
+            "dev": v["dev"], "dev_name": names.get(v["dev"]) or vendors.get(v["dev"], ""),
+            "rem": v["rem"], "ports": v["ports"], "count": v["count"],
+            "age": round(now - v["last"], 1),
+            "active": now - v["last"] <= STALE_AFTER,
+            "country": gg.get("country", ""), "cc": gg.get("countryCode", ""),
+            "isp": gg.get("isp", ""), "threat": threat_match(v["rem"])})
+    inbound.sort(key=lambda x: (-x["active"], -x["count"]))
+
+    # Top talkers by data volume
+    top_devices = sorted(
+        ({"ip": d["ip"], "name": d["name"] or d["vendor"] or d["ip"],
+          "up": d["up"], "down": d["down"], "total": d["up"] + d["down"]}
+         for d in dev_list), key=lambda d: -d["total"])[:12]
+    top_dests = sorted(
+        ({"ip": d["ip"], "host": d["host"] or d["ip"],
+          "cc": (d["geo"] or {}).get("countryCode", ""),
+          "up": d["up"], "down": d["down"], "total": d["up"] + d["down"]}
+         for d in dest_list), key=lambda d: -d["total"])[:12]
+
     return {
         "home": HOME, "geo_state": GEO_STATE,
         "capture": {"iface": CAP_STATE["iface"], "pps": CAP_STATE["pps"],
@@ -1138,9 +1380,11 @@ def snapshot():
         "threat": threat_stat,
         "stats": {"active": active_flows, "devices": len(dev_list),
                   "dests": len(dest_list), "countries": len(countries),
-                  "flagged": flagged, "alerts": len(alerts)},
+                  "flagged": flagged, "alerts": len(alerts),
+                  "inbound": len(inbound)},
         "alerts": alerts,
-        "devices": dev_list, "dests": dest_list,
+        "devices": dev_list, "dests": dest_list, "inbound": inbound,
+        "top_devices": top_devices, "top_dests": top_dests,
     }
 
 
@@ -1227,6 +1471,20 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers(); self.wfile.write(body)
             _save_cache()
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+        elif self.path == "/alerts/clear":
+            with LOCK:
+                ALERTS.clear()
+                _alert_dedup.clear()   # let repeats re-alert after a manual clear
+            try:
+                con = db_connect(); con.execute("DELETE FROM alerts")
+                con.commit(); con.close()
+            except Exception:
+                pass
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
         else:
             self.send_response(404); self.end_headers()
 
@@ -1331,6 +1589,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .bytes{color:var(--text-muted);font-size:11px;font-variant-numeric:tabular-nums}
   .tile.alert{cursor:pointer} .tile.alert:hover{background:#3a2a10}
   .tile.flagged b{color:var(--bad)}
+  .tile.inbound b{color:var(--warn)}
+  .vendor{color:var(--text-muted);font-weight:400;font-size:11px}
+  /* top talkers */
+  .tt-row{padding:7px 12px;border-bottom:1px solid #262623}
+  .tt-row .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+  .tt-row .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tt-row .tot{color:var(--text-secondary);font-size:11px;flex:none;font-variant-numeric:tabular-nums}
+  .bar{height:6px;border-radius:3px;background:var(--surface-3);margin-top:5px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--series-1);border-radius:3px}
+  .bar i.dl{background:var(--series-1)}
+  .updown{color:var(--text-muted);font-size:10px;margin-top:2px}
+  /* inbound rows */
+  .inb{padding:8px 12px;border-bottom:1px solid #262623;border-left:3px solid var(--warn)}
+  .inb.bad{border-left-color:var(--bad)}
+  .inb .nm{font-weight:600}
+  .inb .meta{color:var(--text-secondary);font-size:12px;margin-top:1px}
+  .inb .ipline{color:var(--text-muted);font-size:11px;font-family:Consolas,ui-monospace,monospace;margin-top:1px}
+  #alertClear{font-size:11px !important;border:1px solid var(--border) !important;border-radius:6px;
+    padding:3px 9px !important;margin-right:8px;color:var(--text-secondary) !important}
+  #alertClear:hover{border-color:var(--bad) !important;color:var(--text-primary) !important}
   /* header alert button */
   #alertBtn{align-self:center;background:var(--surface-3);border:1px solid var(--border);
     color:var(--text-secondary);border-radius:8px;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer;position:relative}
@@ -1372,6 +1650,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="tile"><b id="tDevices">–</b><small>devices</small></div>
       <div class="tile"><b id="tDests">–</b><small>destinations</small></div>
       <div class="tile flagged"><b id="tFlagged">–</b><small>flagged</small></div>
+      <div class="tile inbound"><b id="tInbound">–</b><small>inbound</small></div>
       <button id="alertBtn" title="Show alerts">&#9873; alerts<span class="n" id="alertN" style="display:none">0</span></button>
       <button id="quitBtn" title="Stop NetWatch">&#10005; quit</button>
     </div>
@@ -1384,13 +1663,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="seg">
         <button id="segLive" class="on">Live</button>
         <button id="segHist">History 24h</button>
+        <button id="segTop">Top Talkers</button>
       </div>
       <div id="list"><div class="empty">Waiting for traffic&hellip;</div></div>
     </aside>
   </main>
 </div>
 <div id="alerts">
-  <div class="hd"><span>Alerts</span><button id="alertClose">&times;</button></div>
+  <div class="hd"><span>Alerts</span><span>
+    <button id="alertClear" title="Clear all alerts">clear</button>
+    <button id="alertClose">&times;</button></span></div>
   <div id="alertList"><div class="empty">No alerts yet.</div></div>
 </div>
 <div id="banner"></div>
@@ -1441,7 +1723,7 @@ function dotIcon(extra,size,color){
   return L.divIcon({className:"",iconSize:[size,size],
     html:'<div class="nm-dot '+extra+'"><span class="ring" '+rst+'></span><span class="core" '+st+'></span></div>'});}
 function devLabel(ip){const n=(latest&&latest.devices||[]).find(d=>d.ip===ip);
-  return n&&n.name?n.name:ip;}
+  return n?(n.name||n.vendor||ip):ip;}
 function fmtBytes(b){if(!b)return "0 B";
   if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";
   if(b<1073741824)return (b/1048576).toFixed(1)+" MB";return (b/1073741824).toFixed(2)+" GB";}
@@ -1464,6 +1746,7 @@ function render(d){
   document.getElementById("tDevices").textContent=d.stats.devices;
   document.getElementById("tDests").textContent=d.stats.dests;
   document.getElementById("tFlagged").textContent=d.stats.flagged;
+  document.getElementById("tInbound").textContent=d.stats.inbound||0;
 
   const th=d.threat||{}, thp=document.getElementById("threatPill"), tht=document.getElementById("threatTxt");
   if(th.loaded){thp.style.display="";thp.className="pill"+(d.stats.flagged?" bad":"");
@@ -1548,21 +1831,44 @@ function bypassBadges(dv){
     :'<span class="badge2 dns" title="Using an external DNS resolver, bypassing Pi-hole">&#9888; ext-DNS</span>').join("");
 }
 
+function inboundRow(ib){
+  return '<div class="inb'+(ib.threat?" bad":"")+'"><div class="nm">'
+    +(ib.threat?'<span class="badge2 threat">&#9888; flagged</span> ':"")
+    +flag(ib.cc)+" "+esc(ib.rem)+"</div>"
+    +'<div class="meta">to <b>'+esc(ib.dev_name||ib.dev)+"</b> on port"+(ib.ports.length>1?"s":"")
+    +" "+ib.ports.join(", ")+(ib.country?" &middot; from "+esc(ib.country):"")+"</div>"
+    +'<div class="ipline">'+ib.count+" attempt"+(ib.count===1?"":"s")
+    +(ib.isp?" &middot; "+esc(ib.isp):"")+"</div></div>";
+}
+
 function renderList(){
   if(!latest)return;
   if(mode==="hist"){renderHistory();return;}
+  if(mode==="top"){renderTop();return;}
   const q=document.getElementById("q").value.trim().toLowerCase();
   const list=document.getElementById("list");
   let html="";
 
+  // Inbound connection attempts (usually empty behind NAT; shown when present)
+  if(latest.inbound && latest.inbound.length){
+    const ib=latest.inbound.filter(x=>{
+      const hay=(x.rem+" "+(x.dev_name||x.dev)+" "+(x.country||"")).toLowerCase();
+      return !q||hay.includes(q);
+    });
+    if(ib.length)
+      html+='<div class="section-hd"><span>&#9888; Inbound connections</span></div>'
+        +ib.map(inboundRow).join("");
+  }
+
   const drows=[];
   for(const dv of latest.devices){
-    const label=dv.name||dv.ip;
+    const label=dv.name||dv.vendor||dv.ip;
     if(q && !(label+" "+dv.ip).toLowerCase().includes(q)) continue;
     const tb=dv.threats?'<span class="badge2 threat" title="talks to a flagged IP">&#9888;</span>':"";
+    const vend=(!dv.name&&dv.vendor)?'<span class="vendor">('+esc(dv.vendor)+")</span>":"";
     drows.push('<div class="row'+(dv.active?"":" off")+(dv.threats?" flag":"")+(selDev===dv.ip?" sel":"")
       +'" data-dev="'+esc(dv.ip)+'"><div class="top"><div class="nm">'
-      +'<span class="sw" style="background:'+colorFor(dv.ip)+'"></span>'+esc(label)+" "+tb+bypassBadges(dv)+"</div>"
+      +'<span class="sw" style="background:'+colorFor(dv.ip)+'"></span>'+esc(label)+" "+vend+" "+tb+bypassBadges(dv)+"</div>"
       +'<div class="cnt">'+dv.ndest+" dest"+(dv.ndest===1?"":"s")+"</div></div>"
       +'<div class="ipline">'+esc(dv.ip)+'</div>'
       +'<div class="bytes">&#8593; '+fmtBytes(dv.up)+" &nbsp; &#8595; "+fmtBytes(dv.down)+"</div></div>");
@@ -1628,15 +1934,39 @@ function renderHistory(){
     +(rows||'<div class="empty">No history in this window yet.</div>');
 }
 
+function renderTop(){
+  const list=document.getElementById("list");
+  const dv=latest.top_devices||[], ds=latest.top_dests||[];
+  const maxD=Math.max(1,...dv.map(x=>x.total));
+  const maxT=Math.max(1,...ds.map(x=>x.total));
+  const bar=(v,max,cls)=>'<div class="bar"><i class="'+cls+'" style="width:'
+    +Math.max(2,Math.round(v/max*100))+'%"></i></div>';
+  let html='<div class="section-hd"><span>Top devices by volume</span></div>';
+  html+=dv.length?dv.map(x=>'<div class="tt-row"><div class="top"><div class="nm">'
+    +esc(x.name)+'</div><div class="tot">'+fmtBytes(x.total)+"</div></div>"
+    +bar(x.total,maxD,"")
+    +'<div class="updown">&#8593; '+fmtBytes(x.up)+" &nbsp; &#8595; "+fmtBytes(x.down)+"</div></div>").join("")
+    :'<div class="empty">No traffic yet&hellip;</div>';
+  html+='<div class="section-hd"><span>Top destinations by volume</span></div>';
+  html+=ds.length?ds.map(x=>'<div class="tt-row"><div class="top"><div class="nm">'
+    +flag(x.cc)+" "+esc(x.host)+'</div><div class="tot">'+fmtBytes(x.total)+"</div></div>"
+    +bar(x.total,maxT,"")
+    +'<div class="updown">&#8593; '+fmtBytes(x.up)+" &nbsp; &#8595; "+fmtBytes(x.down)+"</div></div>").join("")
+    :'<div class="empty">No traffic yet&hellip;</div>';
+  list.innerHTML=html;
+}
+
 let mode="live";
 function setMode(m){
   mode=m;
   document.getElementById("segLive").classList.toggle("on",m==="live");
   document.getElementById("segHist").classList.toggle("on",m==="hist");
+  document.getElementById("segTop").classList.toggle("on",m==="top");
   if(m==="hist")loadHistory(); else renderList();
 }
 document.getElementById("segLive").addEventListener("click",()=>setMode("live"));
 document.getElementById("segHist").addEventListener("click",()=>setMode("hist"));
+document.getElementById("segTop").addEventListener("click",()=>setMode("top"));
 
 document.getElementById("list").addEventListener("click",e=>{
   if(e.target.id==="clearSel"){selDev=null;wipeLayers();render(latest);return;}
@@ -1654,6 +1984,12 @@ document.getElementById("q").addEventListener("input",()=>{mode==="hist"?renderH
 const alertsPanel=document.getElementById("alerts");
 document.getElementById("alertBtn").addEventListener("click",()=>alertsPanel.classList.toggle("open"));
 document.getElementById("alertClose").addEventListener("click",()=>alertsPanel.classList.remove("open"));
+document.getElementById("alertClear").addEventListener("click",async()=>{
+  try{await fetch("/alerts/clear",{method:"POST"});}catch(e){}
+  renderAlerts([]);
+  document.getElementById("alertN").style.display="none";
+  document.getElementById("alertBtn").classList.remove("has");
+});
 
 let quitting=false;
 document.getElementById("quitBtn").addEventListener("click",async()=>{
@@ -1723,9 +2059,11 @@ def main():
         threading.Thread(target=name_worker, name="name", daemon=True).start()
     threading.Thread(target=geo_worker, name="geo", daemon=True).start()
     threading.Thread(target=threat_worker, name="threat", daemon=True).start()
+    threading.Thread(target=oui_worker, name="oui", daemon=True).start()
     threading.Thread(target=db_worker, name="db", daemon=True).start()
     threading.Thread(target=seen_writer, name="seen", daemon=True).start()
     threading.Thread(target=alert_worker, name="alert", daemon=True).start()
+    threading.Thread(target=digest_worker, name="digest", daemon=True).start()
     threading.Thread(target=snapshot_worker, name="snapshot", daemon=True).start()
     threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
 
