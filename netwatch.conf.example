@@ -4,6 +4,9 @@
   "pihole_ips": ["192.168.1.2", "192.168.1.3"],
   "_pihole_ips": "Your Pi-hole IP(s). Any device sending plain DNS (port 53) to something NOT in this list is flagged as a DNS bypass. You can also pass these with --pihole on the command line.",
 
+  "ignore_devices": ["192.168.1.2", "192.168.1.3"],
+  "_ignore_devices": "LAN device IPs to exclude COMPLETELY - not listed, mapped, flagged, or alerted. Put infrastructure here (your Pi-hole/unbound resolvers, a VPN gateway, etc.) since a recursive resolver legitimately talks to thousands of nameservers worldwide and would otherwise flood the map and alerts. Can also pass with --ignore on the command line.",
+
   "learn_minutes": 30,
   "_learn_minutes": "Warm-up window. During this time NetWatch learns each device's normal countries/destinations silently and does NOT send new-country alerts, so you don't get flooded on first start. Threat and bypass alerts still fire immediately.",
 

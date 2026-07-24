@@ -109,6 +109,7 @@ CAP_STATE = {"iface": "", "pkts": 0, "pps": 0.0, "drops": 0, "error": None,
 START_TS = time.time()
 CONF = {}       # loaded from netwatch.conf (alert channels, pihole ip, etc.)
 PIHOLE_IPS = set()
+IGNORE = set()   # LAN device IPs to exclude entirely (e.g. your resolvers)
 SNAP_CACHE = {"bytes": b'{"stats":{"active":0,"devices":0,"dests":0,'
               b'"countries":0,"flagged":0,"alerts":0},"devices":[],"dests":[],'
               b'"alerts":[],"home":null,"geo_state":"waiting","capture":{},'
@@ -375,7 +376,9 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new):
         try:
             sa = ipaddress.ip_address(pk["src"])
             da = ipaddress.ip_address(pk["dst"])
-            if is_private_lan(sa) and da.is_global and pk["dst"] not in PIHOLE_IPS:
+            # Don't flag an excluded resolver's own upstream DNS as a "bypass".
+            if (pk["src"] not in IGNORE and is_private_lan(sa) and da.is_global
+                    and pk["dst"] not in PIHOLE_IPS):
                 bypass_new.append((pk["src"], "plaintext-dns", pk["dst"]))
         except ValueError:
             pass
@@ -384,6 +387,8 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new):
     if not c:
         return
     dev, rem, direction = c
+    if dev in IGNORE:      # excluded device: not listed, mapped, flagged or alerted
+        return
     port = pk["dport"] if direction == "out" else pk["sport"]
     host = None
     if (direction == "out" and pk["proto"] == "tcp" and pk["dport"] == 443
@@ -650,7 +655,7 @@ def geo_worker():
 # ----------------------------------------------------------------------------
 
 def load_config():
-    global CONF, PIHOLE_IPS
+    global CONF, PIHOLE_IPS, IGNORE
     cfg = {}
     try:
         with open(CONF_FILE, "r", encoding="utf-8") as f:
@@ -662,6 +667,7 @@ def load_config():
         print("  config error (%s); using defaults" % e)
     CONF = cfg
     PIHOLE_IPS = set(cfg.get("pihole_ips", []))
+    IGNORE = set(cfg.get("ignore_devices", []))
 
 
 # ----------------------------------------------------------------------------
@@ -1675,6 +1681,8 @@ def main():
     ap.add_argument("--home", metavar="LAT,LON")
     ap.add_argument("--pihole", metavar="IP", action="append", default=[],
                     help="your Pi-hole IP(s); DNS to anything else flags a bypass")
+    ap.add_argument("--ignore", metavar="IP", action="append", default=[],
+                    help="LAN device IP(s) to exclude entirely (e.g. your resolvers)")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--no-alerts", action="store_true",
                     help="collect data but never send notifications")
@@ -1693,10 +1701,14 @@ def main():
     load_config()
     if args.pihole:
         PIHOLE_IPS.update(args.pihole)
+    if args.ignore:
+        IGNORE.update(args.ignore)
     if args.no_alerts:
         CONF["notify"] = {}
     if PIHOLE_IPS:
         print("  Pi-hole IPs: %s" % ", ".join(sorted(PIHOLE_IPS)))
+    if IGNORE:
+        print("  ignoring devices: %s" % ", ".join(sorted(IGNORE)))
     _load_cache()
 
     if args.demo:
