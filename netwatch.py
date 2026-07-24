@@ -926,7 +926,7 @@ def db_worker():
         # threat matching AFTER releasing it (threat_match takes the lock itself
         # and iterates thousands of CIDRs — never hold LOCK across that).
         with LOCK:
-            raw = [(f["dev"], DEV_NAMES.get(f["dev"], ""), f["rem"],
+            raw = [(f["dev"], DEV_NAMES.get(f["dev"]) or mac_vendor(f["dev"]), f["rem"],
                     f.get("host") or IPDOMAIN.get(f["rem"], ""),
                     (GEO.get(f["rem"]) or {}), f["first"], f["last"],
                     f["up"], f["down"]) for f in FLOWS.values()]
@@ -1188,47 +1188,73 @@ def _fmt_bytes(b):
     return "%.1f PB" % b
 
 
-def build_digest():
-    since = time.time() - DIGEST_INTERVAL
-    con = db_connect()
-    sess = con.execute("SELECT dev,dev_name,rem,host,cc,country,up,down,threat "
-                       "FROM sessions WHERE last>=?", (since,)).fetchall()
-    alerts = con.execute("SELECT kind,level,ts FROM alerts WHERE ts>=?",
-                         (since,)).fetchall()
-    con.close()
-    dev_bytes, countries, dests, threats = {}, set(), set(), []
+def digest_data(days):
+    """Structured summary of the last `days` days, shared by the on-screen
+    digest panel and the weekly email."""
+    since = time.time() - days * 86400
+    try:
+        con = db_connect()
+        sess = con.execute("SELECT dev,dev_name,rem,host,cc,country,up,down,threat "
+                           "FROM sessions WHERE last>=?", (since,)).fetchall()
+        alerts = con.execute("SELECT kind FROM alerts WHERE ts>=?",
+                             (since,)).fetchall()
+        con.close()
+    except Exception:
+        sess, alerts = [], []
+    dev_b, dest_b, countries, threats = {}, {}, set(), []
     total = 0
     for dev, dname, rem, host, cc, country, up, down, threat in sess:
-        vol = (up or 0) + (down or 0)
-        total += vol
-        dev_bytes[dev] = dev_bytes.get(dev, [dname, 0])
-        dev_bytes[dev][0] = dname or dev_bytes[dev][0]
-        dev_bytes[dev][1] += vol
+        up, down = up or 0, down or 0
+        total += up + down
+        d = dev_b.setdefault(dev, {"name": dname or dev, "up": 0, "down": 0})
+        if dname:
+            d["name"] = dname
+        d["up"] += up; d["down"] += down
+        t = dest_b.setdefault(rem, {"host": host or rem, "cc": cc or "",
+                                    "up": 0, "down": 0})
+        if host and t["host"] == rem:
+            t["host"] = host
+        t["up"] += up; t["down"] += down
         if cc:
             countries.add(cc)
-        dests.add(rem)
         if threat:
-            threats.append("%s -> %s (%s)" % (dname or dev, host or rem, country or cc))
-    akinds = {}
-    for kind, level, ts in alerts:
-        akinds[kind] = akinds.get(kind, 0) + 1
+            threats.append({"dev": dname or dev, "rem": host or rem,
+                            "country": country or cc})
+    by_kind = {}
+    for (kind,) in alerts:
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+    top_dev = sorted(({"name": v["name"], "up": v["up"], "down": v["down"],
+                       "total": v["up"] + v["down"]} for v in dev_b.values()),
+                     key=lambda x: -x["total"])[:10]
+    top_dst = sorted(({"host": v["host"], "cc": v["cc"], "up": v["up"],
+                       "down": v["down"], "total": v["up"] + v["down"]}
+                      for v in dest_b.values()), key=lambda x: -x["total"])[:10]
+    return {"days": days, "total": total, "devices": len(dev_b),
+            "dests": len(dest_b), "countries": len(countries),
+            "top_devices": top_dev, "top_dests": top_dst,
+            "alerts_total": len(alerts), "alerts_by_kind": by_kind,
+            "threats": threats}
 
+
+def build_digest():
+    d = digest_data(DIGEST_INTERVAL // 86400)
     L = ["NetWatch weekly digest", "=" * 40, ""]
-    L.append("Total traffic seen: %s across %d devices, %d destinations, %d countries."
-             % (_fmt_bytes(total), len(dev_bytes), len(dests), len(countries)))
+    L.append("Total traffic seen: %s across %d devices, %d destinations, "
+             "%d countries." % (_fmt_bytes(d["total"]), d["devices"],
+                                d["dests"], d["countries"]))
     L.append("")
     L.append("Top talkers (by data volume):")
-    for dev, (dname, vol) in sorted(dev_bytes.items(), key=lambda x: -x[1][1])[:10]:
-        L.append("  %-22s %s" % (dname or dev, _fmt_bytes(vol)))
+    for x in d["top_devices"]:
+        L.append("  %-22s %s" % (x["name"], _fmt_bytes(x["total"])))
     L.append("")
-    L.append("Alerts this week: %d total" % len(alerts))
-    for kind, cnt in sorted(akinds.items(), key=lambda x: -x[1]):
+    L.append("Alerts this week: %d total" % d["alerts_total"])
+    for kind, cnt in sorted(d["alerts_by_kind"].items(), key=lambda x: -x[1]):
         L.append("  %-18s %d" % (kind.replace("_", " "), cnt))
-    if threats:
+    if d["threats"]:
         L.append("")
-        L.append("Threat-list hits (%d):" % len(threats))
-        for t in threats[:15]:
-            L.append("  " + t)
+        L.append("Threat-list hits (%d):" % len(d["threats"]))
+        for t in d["threats"][:15]:
+            L.append("  %s -> %s (%s)" % (t["dev"], t["rem"], t["country"]))
     L.append("")
     L.append("- NetWatch")
     return "\n".join(L)
@@ -1453,6 +1479,11 @@ class Handler(BaseHTTPRequestHandler):
             since = time.time() - hours * 3600
             body = json.dumps({"rows": db_history(since, dev)}).encode("utf-8")
             ctype = "application/json"
+        elif u.path == "/digest":
+            q = parse_qs(u.query)
+            days = max(1, min(90, int(float(q.get("days", ["7"])[0]))))
+            body = json.dumps(digest_data(days)).encode("utf-8")
+            ctype = "application/json"
         else:
             self.send_response(404); self.end_headers(); return
         self.send_response(200)
@@ -1628,6 +1659,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-bottom:1px solid var(--border);font-weight:600}
   #alerts .hd button{background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer}
   #alertList{overflow-y:auto;flex:1}
+  /* digest panel */
+  #digest{position:absolute;top:0;right:0;width:420px;max-width:94vw;height:100%;z-index:1500;
+    background:var(--surface-2);border-left:1px solid var(--border);box-shadow:-8px 0 24px #0009;
+    transform:translateX(100%);transition:transform .18s ease;display:flex;flex-direction:column}
+  #digest.open{transform:none}
+  #digest .hd{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;
+    border-bottom:1px solid var(--border);font-weight:600}
+  #digest .hd button{background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer}
+  .dseg{display:flex;gap:2px;padding:8px 12px;border-bottom:1px solid var(--border)}
+  .dseg button{flex:1;background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
+    padding:5px;font:inherit;font-size:11px;cursor:pointer;border-radius:6px}
+  .dseg button.on{background:#20303f;border-color:var(--series-1);color:var(--text-primary)}
+  #digestBody{overflow-y:auto;flex:1;padding:4px 0 30px}
+  .dg-hero{padding:14px;text-align:center;border-bottom:1px solid var(--border)}
+  .dg-hero b{display:block;font-size:26px;font-variant-numeric:tabular-nums}
+  .dg-hero small{color:var(--text-muted);font-size:12px}
+  .dg-stats{display:flex;justify-content:space-around;padding:10px 8px;border-bottom:1px solid var(--border);text-align:center}
+  .dg-stats div b{display:block;font-size:16px} .dg-stats div small{color:var(--text-muted);font-size:10px;text-transform:uppercase}
+  #digestBtn{align-self:center;background:var(--surface-3);border:1px solid var(--border);
+    color:var(--text-secondary);border-radius:8px;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}
+  #digestBtn:hover{border-color:var(--series-1);color:var(--text-primary)}
   .al{padding:9px 14px;border-bottom:1px solid #262623;border-left:3px solid var(--text-muted)}
   .al.critical{border-left-color:var(--bad)} .al.warning{border-left-color:var(--warn)}
   .al.notice{border-left-color:var(--series-1)} .al.info{border-left-color:var(--text-muted)}
@@ -1651,6 +1703,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="tile"><b id="tDests">–</b><small>destinations</small></div>
       <div class="tile flagged"><b id="tFlagged">–</b><small>flagged</small></div>
       <div class="tile inbound"><b id="tInbound">–</b><small>inbound</small></div>
+      <button id="digestBtn" title="Show a summary">&#9776; digest</button>
       <button id="alertBtn" title="Show alerts">&#9873; alerts<span class="n" id="alertN" style="display:none">0</span></button>
       <button id="quitBtn" title="Stop NetWatch">&#10005; quit</button>
     </div>
@@ -1674,6 +1727,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button id="alertClear" title="Clear all alerts">clear</button>
     <button id="alertClose">&times;</button></span></div>
   <div id="alertList"><div class="empty">No alerts yet.</div></div>
+</div>
+<div id="digest">
+  <div class="hd"><span>Summary</span><button id="digestClose">&times;</button></div>
+  <div class="dseg">
+    <button data-days="1">24 h</button>
+    <button data-days="7" class="on">7 days</button>
+    <button data-days="30">30 days</button>
+  </div>
+  <div id="digestBody"><div class="empty">Loading&hellip;</div></div>
 </div>
 <div id="banner"></div>
 <div id="stopped"><div><b>NetWatch stopped</b>You can close this tab.</div></div>
@@ -1990,6 +2052,58 @@ document.getElementById("alertClear").addEventListener("click",async()=>{
   document.getElementById("alertN").style.display="none";
   document.getElementById("alertBtn").classList.remove("has");
 });
+
+// ---- Digest panel ----
+const digestPanel=document.getElementById("digest");
+let digestDays=7;
+async function loadDigest(){
+  const body=document.getElementById("digestBody");
+  body.innerHTML='<div class="empty">Loading&hellip;</div>';
+  let d;
+  try{ d=await (await fetch("/digest?days="+digestDays,{cache:"no-store"})).json(); }
+  catch(e){ body.innerHTML='<div class="empty">Could not load summary.</div>'; return; }
+  const label=digestDays===1?"last 24 hours":"last "+digestDays+" days";
+  const maxD=Math.max(1,...d.top_devices.map(x=>x.total));
+  const maxT=Math.max(1,...d.top_dests.map(x=>x.total));
+  const bar=(v,max)=>'<div class="bar"><i style="width:'+Math.max(2,Math.round(v/max*100))+'%"></i></div>';
+  let h='<div class="dg-hero"><b>'+fmtBytes(d.total)+"</b><small>total traffic &middot; "+label+"</small></div>";
+  h+='<div class="dg-stats">'
+    +'<div><b>'+d.devices+"</b><small>devices</small></div>"
+    +'<div><b>'+d.dests+"</b><small>destinations</small></div>"
+    +'<div><b>'+d.countries+"</b><small>countries</small></div>"
+    +'<div><b>'+d.alerts_total+"</b><small>alerts</small></div></div>";
+  h+='<div class="section-hd"><span>Top devices</span></div>';
+  h+=d.top_devices.length?d.top_devices.map(x=>'<div class="tt-row"><div class="top">'
+    +'<div class="nm">'+esc(x.name)+'</div><div class="tot">'+fmtBytes(x.total)+"</div></div>"+bar(x.total,maxD)
+    +'<div class="updown">&#8593; '+fmtBytes(x.up)+" &nbsp; &#8595; "+fmtBytes(x.down)+"</div></div>").join("")
+    :'<div class="empty">No traffic in this window.</div>';
+  h+='<div class="section-hd"><span>Top destinations</span></div>';
+  h+=d.top_dests.length?d.top_dests.map(x=>'<div class="tt-row"><div class="top">'
+    +'<div class="nm">'+flag(x.cc)+" "+esc(x.host)+'</div><div class="tot">'+fmtBytes(x.total)+"</div></div>"+bar(x.total,maxT)+"</div>").join("")
+    :"";
+  h+='<div class="section-hd"><span>Alerts ('+d.alerts_total+")</span></div>";
+  const kinds=Object.entries(d.alerts_by_kind).sort((a,b)=>b[1]-a[1]);
+  h+=kinds.length?kinds.map(([k,c])=>'<div class="row"><div class="top"><div class="nm">'
+    +esc(k.replace(/_/g," "))+'</div><div class="cnt">'+c+"</div></div></div>").join("")
+    :'<div class="empty">No alerts in this window.</div>';
+  if(d.threats.length){
+    h+='<div class="section-hd"><span>&#9888; Threat-list hits ('+d.threats.length+")</span></div>";
+    h+=d.threats.slice(0,20).map(t=>'<div class="row flag"><div class="nm">'+esc(t.dev)
+      +" &rarr; "+esc(t.rem)+'</div><div class="ipline">'+esc(t.country||"")+"</div></div>").join("");
+  }
+  document.getElementById("digestBody").innerHTML=h;
+}
+document.getElementById("digestBtn").addEventListener("click",()=>{
+  const opening=!digestPanel.classList.contains("open");
+  digestPanel.classList.toggle("open");
+  if(opening)loadDigest();
+});
+document.getElementById("digestClose").addEventListener("click",()=>digestPanel.classList.remove("open"));
+document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",()=>{
+  digestDays=+b.dataset.days;
+  document.querySelectorAll(".dseg button").forEach(x=>x.classList.toggle("on",x===b));
+  loadDigest();
+}));
 
 let quitting=false;
 document.getElementById("quitBtn").addEventListener("click",async()=>{
