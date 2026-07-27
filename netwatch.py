@@ -73,6 +73,11 @@ DIGEST_STATE = os.path.join(HERE, "netwatch_digest.json")
 
 STALE_AFTER = 10       # seconds since last packet -> flow shown as fading
 DROP_AFTER = 120       # seconds since last packet -> flow removed
+INBOUND_RETAIN = 6 * 3600  # keep inbound-connection records visible this long
+                           # (6h). An inbound hit is a security EVENT, not a live
+                           # flow: it should linger on the counter/panel like its
+                           # alert does, not vanish in 2 minutes.
+INBOUND_MAX = 400      # cap on retained inbound records (drop oldest beyond this)
 GEO_RETRY = 60
 CACHE_SAVE_EVERY = 30
 CAP_BYTES = 512        # bytes captured per frame (enough for headers + most SNI)
@@ -541,8 +546,12 @@ def _prune(now):
     with LOCK:
         for k in [k for k, f in FLOWS.items() if now - f["last"] > DROP_AFTER]:
             del FLOWS[k]
-        for k in [k for k, v in INBOUND.items() if now - v["last"] > DROP_AFTER]:
+        for k in [k for k, v in INBOUND.items() if now - v["last"] > INBOUND_RETAIN]:
             del INBOUND[k]
+        if len(INBOUND) > INBOUND_MAX:      # bound memory: keep the most recent
+            for k, _ in sorted(INBOUND.items(), key=lambda kv: kv[1]["last"]
+                               )[:len(INBOUND) - INBOUND_MAX]:
+                del INBOUND[k]
 
 
 # ----------------------------------------------------------------------------
