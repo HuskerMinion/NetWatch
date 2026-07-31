@@ -229,6 +229,38 @@ def test_alert_pass_skips_devices_with_unknown_mac():
                for a in nw.ALERTS), "must alert once the MAC becomes known"
 
 
+def test_digest_includes_per_kind_device_breakdown():
+    # The on-screen digest lets you click an alert-kind row (e.g. "bypass doh")
+    # to see which devices triggered it -- that relies on alerts_by_kind_dev.
+    _fresh_db()
+    con = nw.db_connect()
+    now = time.time()
+    def a(kind, dev, dev_name, ts):
+        con.execute("INSERT INTO alerts(ts,level,kind,dev,dev_name,rem,host,msg) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (ts, "warning", kind, dev, dev_name, "", "", "m"))
+    a("bypass_doh", "192.168.1.10", "TV", now - 10)
+    a("bypass_doh", "192.168.1.10", "TV", now - 5)     # same (kind,dev) -> counted together
+    a("bypass_dot", "192.168.1.20", "Phone", now - 8)
+    a("dev_country", "192.168.1.10", "TV", now - 3)
+    con.commit(); con.close()
+    d = nw.digest_data(1)
+    assert d["alerts_by_kind"] == {"bypass_doh": 2, "bypass_dot": 1, "dev_country": 1}
+    bkd = d["alerts_by_kind_dev"]
+    assert bkd["bypass_doh"] == [{"dev": "192.168.1.10", "dev_name": "TV", "count": 2}]
+    assert bkd["bypass_dot"] == [{"dev": "192.168.1.20", "dev_name": "Phone", "count": 1}]
+
+
+def test_dashboard_digest_alerts_are_clickable_and_merge_doh_dot():
+    # Regression guard for the digest panel: DoH and DoT bypass rows must be
+    # merged into a single "bypass DoH/DoT" row, and every alert-kind row must
+    # be expandable (data-gi + a per-kind device list) rather than static text.
+    src = open(os.path.join(ROOT, "netwatch.py")).read()
+    assert 'bypass DoH/DoT' in src
+    assert 'data-gi=' in src
+    assert 'kinddevs' in src
+
+
 def test_dot_bypass_has_distinct_dashboard_badge():
     # Regression guard: bypassBadges() in the embedded dashboard JS once only
     # special-cased "doh", silently lumping "dot" (DoT) in with plaintext DNS

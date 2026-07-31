@@ -57,7 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.07.31.4"  # date + same-day build number, so successive changes on
+VERSION = "2026.07.31.5"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -1443,6 +1443,7 @@ def digest_data(days):
     total = devices = dests = countries = 0
     top_dev, top_dst, threats, dns_rows = [], [], [], []
     by_kind = {}
+    by_kind_dev = {}
     try:
         con = db_connect()
         # Aggregate in SQL (uses the ix_sess_last index) instead of pulling every
@@ -1467,6 +1468,16 @@ def digest_data(days):
         by_kind = {k: c for (k, c) in con.execute(
             "SELECT kind, COUNT(*) FROM alerts WHERE ts>=? GROUP BY kind",
             (since,))}
+        # Per-(kind,device) breakdown so the on-screen digest can drill into "which
+        # devices triggered this alert kind" when a row is clicked.
+        by_kind_dev = {}
+        for kind, dev, dev_name, cnt in con.execute(
+                "SELECT kind, dev, MAX(dev_name), COUNT(*) FROM alerts "
+                "WHERE ts>=? GROUP BY kind, dev", (since,)):
+            by_kind_dev.setdefault(kind, []).append(
+                {"dev": dev, "dev_name": dev_name or "", "count": cnt})
+        for lst in by_kind_dev.values():
+            lst.sort(key=lambda x: -x["count"])
         threats = [{"dev": nm or dev, "rem": host or rem, "country": country or cc}
                    for dev, nm, rem, host, country, cc in con.execute(
                        "SELECT dev, MAX(dev_name), rem, MAX(host), MAX(country), "
@@ -1480,6 +1491,7 @@ def digest_data(days):
             "dests": dests, "countries": countries,
             "top_devices": top_dev, "top_dests": top_dst,
             "alerts_total": sum(by_kind.values()), "alerts_by_kind": by_kind,
+            "alerts_by_kind_dev": by_kind_dev,
             "threats": threats, "dns_targets": dns_blocklist()}
 
 
@@ -1955,6 +1967,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .badge2.doh{background:#4a2020;color:#ff9d9d} .badge2.dns{background:#4a3a10;color:#f4c256}
   .badge2.dot{background:#1a3a4a;color:#7dd3fc}
   .badge2.threat{background:var(--bad);color:#fff}
+  .kindrow.open{background:var(--surface-3)}
+  .kinddevs{padding:2px 12px 8px 22px;border-bottom:1px solid #262623}
+  .kinddev{display:flex;justify-content:space-between;gap:8px;font-size:12px;
+    color:var(--text-secondary);padding:3px 0}
+  .kinddev .cnt{color:var(--text-muted);font-size:11px;flex:none}
   .bytes{color:var(--text-muted);font-size:11px;font-variant-numeric:tabular-nums}
   .tile.alert{cursor:pointer} .tile.alert:hover{background:#3a2a10}
   .tile.flagged b{color:var(--bad)}
@@ -2404,6 +2421,48 @@ document.getElementById("alertClear").addEventListener("click",async()=>{
 // ---- Digest panel ----
 const digestPanel=document.getElementById("digest");
 let digestDays=1;
+let digestGroups=[];   // current alert-kind groups, indexed for the click-to-expand handler
+const KIND_LABEL={"dev_rem":"new destination","dev_country":"new country",
+  "threat":"threat-list hit","inbound":"unsolicited inbound",
+  "bypass_plaintext-dns":"bypass plaintext-dns","device":"new device"};
+function alertGroupLabel(kind){
+  if(kind==="bypass_doh"||kind==="bypass_dot")return "bypass DoH/DoT";
+  return KIND_LABEL[kind]||kind.replace(/_/g," ");
+}
+function mergeAlertGroups(d){
+  const byKindDev=d.alerts_by_kind_dev||{};
+  const groupKeyOf=k=>(k==="bypass_doh"||k==="bypass_dot")?"bypass_doh_dot":k;
+  const groups={};
+  for(const [k,c] of Object.entries(d.alerts_by_kind||{})){
+    const gk=groupKeyOf(k);
+    const g=groups[gk]||(groups[gk]={label:alertGroupLabel(k),count:0,devices:{}});
+    g.count+=c;
+    for(const dv of (byKindDev[k]||[])){
+      const cur=g.devices[dv.dev]||{dev:dv.dev,name:dv.dev_name||dv.dev,count:0};
+      cur.count+=dv.count;
+      g.devices[dv.dev]=cur;
+    }
+  }
+  return Object.values(groups).map(g=>({label:g.label,count:g.count,
+    devices:Object.values(g.devices).sort((a,b)=>b.count-a.count)}))
+    .sort((a,b)=>b.count-a.count);
+}
+document.getElementById("digestBody").addEventListener("click",e=>{
+  const row=e.target.closest("[data-gi]");
+  if(!row)return;
+  const box=document.getElementById("kinddevs_"+row.dataset.gi);
+  if(!box)return;
+  const opening=box.style.display==="none";
+  document.querySelectorAll(".kinddevs").forEach(b=>{b.style.display="none";});
+  document.querySelectorAll(".kindrow").forEach(r=>r.classList.remove("open"));
+  if(!opening)return;
+  const g=digestGroups[row.dataset.gi];
+  box.innerHTML=(g&&g.devices.length)?g.devices.map(dv=>'<div class="kinddev"><span>'
+    +esc(dv.name)+'</span><span class="cnt">'+dv.count+"</span></div>").join("")
+    :'<div class="empty">No device breakdown available.</div>';
+  box.style.display="block";
+  row.classList.add("open");
+});
 async function loadDigest(){
   const body=document.getElementById("digestBody");
   body.innerHTML='<div class="empty">Loading&hellip;</div>';
@@ -2430,9 +2489,10 @@ async function loadDigest(){
     +'<div class="nm">'+flag(x.cc)+" "+esc(x.host)+'</div><div class="tot">'+fmtBytes(x.total)+"</div></div>"+bar(x.total,maxT)+"</div>").join("")
     :"";
   h+='<div class="section-hd"><span>Alerts ('+d.alerts_total+")</span></div>";
-  const kinds=Object.entries(d.alerts_by_kind).sort((a,b)=>b[1]-a[1]);
-  h+=kinds.length?kinds.map(([k,c])=>'<div class="row"><div class="top"><div class="nm">'
-    +esc(k.replace(/_/g," "))+'</div><div class="cnt">'+c+"</div></div></div>").join("")
+  digestGroups=mergeAlertGroups(d);
+  h+=digestGroups.length?digestGroups.map((g,i)=>'<div class="row kindrow" data-gi="'+i+'">'
+    +'<div class="top"><div class="nm">'+esc(g.label)+'</div><div class="cnt">'+g.count+"</div></div></div>"
+    +'<div class="kinddevs" id="kinddevs_'+i+'" style="display:none"></div>').join("")
     :'<div class="empty">No alerts in this window.</div>';
   if(d.threats.length){
     h+='<div class="section-hd"><span>&#9888; Threat-list hits ('+d.threats.length+")</span></div>";
