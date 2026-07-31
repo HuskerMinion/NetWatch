@@ -57,7 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.07.31.3"  # date + same-day build number, so successive changes on
+VERSION = "2026.07.31.4"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -116,7 +116,7 @@ DEV_NAMES = {}  # lan_ip -> hostname
 NAMES_OVERRIDE = {}  # normalized MAC or IP -> user-supplied friendly name (top priority)
 IPDOMAIN = {}   # public_ip -> domain (learned from sniffed DNS answers)
 BYPASS = {}     # dev_ip -> {"type": set(), "last": ts, "detail": str}
-SEEN = {"dev_country": set(), "dev_rem": set()}   # baselines loaded from DB
+SEEN = {"dev_country": set(), "dev_rem": set(), "device": set()}  # baselines loaded from DB
 ALERTS = []     # recent alert dicts (also persisted)
 THREAT = {"exact": set(), "nets": [], "loaded": 0, "ts": 0, "error": None}
 DEV_MAC = {}    # lan_ip -> MAC string (from sniffed Ethernet headers)
@@ -1044,6 +1044,8 @@ def db_load_baselines(con):
                 SEEN["dev_country"].add((a, b))
             elif kind == "dev_rem":
                 SEEN["dev_rem"].add((a, b))
+            elif kind == "device":
+                SEEN["device"].add(a)
         for row in con.execute(
                 "SELECT ts,level,kind,dev,dev_name,rem,host,msg FROM alerts "
                 "ORDER BY ts DESC LIMIT ?", (MAX_ALERTS,)):
@@ -1055,8 +1057,9 @@ def db_load_baselines(con):
                 "SELECT dev,server,alerts FROM bypass_seen"):
             _bypass_alert_count[(dev, server)] = alerts
     print("  history: %d known (device,country) pairs, %d alerts, "
-          "%d bypass pairs seen"
-          % (len(SEEN["dev_country"]), len(ALERTS), len(_bypass_alert_count)))
+          "%d bypass pairs seen, %d known device MACs"
+          % (len(SEEN["dev_country"]), len(ALERTS), len(_bypass_alert_count),
+             len(SEEN["device"])))
 
 
 def _backfill_dns_targets(con):
@@ -1234,6 +1237,18 @@ def _alert_pass(warmup):
         inbound = [(v["dev"], v["rem"], sorted(v["ports"])[0] if v["ports"] else 0)
                    for v in INBOUND.values()]
     if True:
+        # new device on the network: fires once per never-before-seen MAC. Keyed on
+        # MAC (not IP) so a DHCP lease renewal on a known device doesn't re-alert,
+        # but a genuinely new NIC joining the LAN does. Devices whose MAC hasn't
+        # been learned yet (no outbound frame captured for them so far) are skipped
+        # this pass and picked up on a later pass once DEV_MAC has it -- normally
+        # within a few seconds, since mac learning happens on their next flush.
+        devs_active = set(f["dev"] for f in flows) | set(d for d, _, _ in inbound)
+        for dev in devs_active:
+            mac = DEV_MAC.get(dev)
+            if mac:
+                _fire("device", dev, mac, "", None, names, learning,
+                      msg="new device joined the network (MAC %s)" % mac)
         # unsolicited inbound connection attempts (someone connecting TO us)
         for dev, rem, port in inbound:
             th = threat_match(rem)
@@ -1268,7 +1283,8 @@ def _alert_pass(warmup):
 
 
 def _fire(kind, dev, key, host, cc, names, learning, msg):
-    """key is rem for dev_rem/threat, cc for dev_country, detail for bypass."""
+    """key is rem for dev_rem/threat, cc for dev_country, mac for device,
+    detail for bypass."""
     rem_field = ""
     if kind == "dev_rem":
         with LOCK:
@@ -1288,6 +1304,14 @@ def _fire(kind, dev, key, host, cc, names, learning, msg):
         if known or learning:
             return
         level = "notice"
+    elif kind == "device":
+        with LOCK:
+            known = key in SEEN["device"]
+            SEEN["device"].add(key)
+        _remember("device", key, "")
+        if known or learning:
+            return
+        level, rem_field = "notice", key
     elif kind == "threat":
         level, rem_field = "critical", key
     elif kind == "inbound":
@@ -1929,6 +1953,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .badge2{font-size:9px;padding:1px 5px;border-radius:4px;font-weight:600;flex:none;
     text-transform:uppercase;letter-spacing:.03em}
   .badge2.doh{background:#4a2020;color:#ff9d9d} .badge2.dns{background:#4a3a10;color:#f4c256}
+  .badge2.dot{background:#1a3a4a;color:#7dd3fc}
   .badge2.threat{background:var(--bad);color:#fff}
   .bytes{color:var(--text-muted);font-size:11px;font-variant-numeric:tabular-nums}
   .tile.alert{cursor:pointer} .tile.alert:hover{background:#3a2a10}
@@ -2211,6 +2236,8 @@ function render(d){
 function bypassBadges(dv){
   return (dv.bypass||[]).map(t=>t==="doh"
     ?'<span class="badge2 doh" title="Using its own encrypted DNS (DoH)">&#9888; DoH</span>'
+    :t==="dot"
+    ?'<span class="badge2 dot" title="Using its own encrypted DNS (DoT)">&#9888; DoT</span>'
     :'<span class="badge2 dns" title="Using an external DNS resolver, bypassing Pi-hole">&#9888; ext-DNS</span>').join("");
 }
 

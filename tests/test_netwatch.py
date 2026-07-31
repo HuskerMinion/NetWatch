@@ -176,6 +176,70 @@ def test_bypass_alert_cap_per_pair():
 
 
 # --------------------------------------------------------------------------- #
+# New-device (new MAC) alert                                                    #
+# --------------------------------------------------------------------------- #
+
+def test_new_device_alert_fires_once_per_mac():
+    nw.CONF = {}
+    nw.ALERTS.clear(); nw._alert_dedup.clear()
+    nw.SEEN["device"].clear()
+    nw._fire("device", "192.168.1.50", "aa:bb:cc:dd:ee:01", "", None, {}, False,
+             "new device joined the network (MAC aa:bb:cc:dd:ee:01)")
+    assert any(a["dev"] == "192.168.1.50" and a["rem"] == "aa:bb:cc:dd:ee:01"
+               for a in nw.ALERTS)
+    n_before = len(nw.ALERTS)
+    # same MAC shows up under a different IP (DHCP lease renewal) -> no re-alert
+    nw._fire("device", "192.168.1.51", "aa:bb:cc:dd:ee:01", "", None, {}, False, "again")
+    assert len(nw.ALERTS) == n_before, "known MAC must not re-alert just because its IP changed"
+
+
+def test_new_device_alert_suppressed_during_learning():
+    nw.CONF = {}
+    nw.ALERTS.clear(); nw._alert_dedup.clear()
+    nw.SEEN["device"].clear()
+    nw._fire("device", "192.168.1.60", "aa:bb:cc:dd:ee:02", "", None, {}, True,
+             "new device joined the network (MAC aa:bb:cc:dd:ee:02)")
+    assert not any(a["rem"] == "aa:bb:cc:dd:ee:02" for a in nw.ALERTS)
+    # learning-window devices are baselined even though they didn't alert, so
+    # they stay quiet afterward too (they were already on the network)
+    nw._fire("device", "192.168.1.60", "aa:bb:cc:dd:ee:02", "", None, {}, False, "again")
+    assert not any(a["rem"] == "aa:bb:cc:dd:ee:02" for a in nw.ALERTS)
+
+
+def test_alert_pass_skips_devices_with_unknown_mac():
+    # A device with only inbound/outbound flows but no learned MAC yet must not
+    # alert -- the whole point is "new MAC", and alerting on a bare IP first would
+    # either miss the real signal or double-alert once the MAC is learned a moment
+    # later.
+    nw.CONF = {}
+    nw.ALERTS.clear(); nw._alert_dedup.clear()
+    nw.SEEN["device"].clear()
+    nw.DEV_MAC = {}
+    now = time.time()
+    nw.FLOWS = {("192.168.1.70", "8.8.8.8"): {
+        "dev": "192.168.1.70", "rem": "8.8.8.8", "proto": "udp", "ports": {53},
+        "first": now, "last": now, "pkts": 1, "up": 10, "down": 0, "host": ""}}
+    nw.GEO = {}; nw.DEV_NAMES = {}; nw.BYPASS = {}; nw.INBOUND = {}
+    nw._alert_pass(0)
+    assert not any(a["kind"] == "device" for a in nw.ALERTS), \
+        "must not alert on a device before its MAC is known"
+    nw.DEV_MAC = {"192.168.1.70": "aa:bb:cc:dd:ee:03"}
+    nw._alert_pass(0)
+    assert any(a["kind"] == "device" and a["rem"] == "aa:bb:cc:dd:ee:03"
+               for a in nw.ALERTS), "must alert once the MAC becomes known"
+
+
+def test_dot_bypass_has_distinct_dashboard_badge():
+    # Regression guard: bypassBadges() in the embedded dashboard JS once only
+    # special-cased "doh", silently lumping "dot" (DoT) in with plaintext DNS
+    # under the generic ext-DNS badge even though the backend already treats
+    # DoT as its own encrypted-DNS category (_bypass_label).
+    src = open(os.path.join(ROOT, "netwatch.py")).read()
+    assert '"badge2 dot"' in src, \
+        "DoT bypass must render its own badge, not fall through to ext-DNS"
+
+
+# --------------------------------------------------------------------------- #
 # Pure parsers / classifier                                                     #
 # --------------------------------------------------------------------------- #
 
