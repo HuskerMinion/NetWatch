@@ -13,8 +13,14 @@
   "alert_new_dest": false,
   "_alert_new_dest": "If true, also alert on every brand-new destination IP/host per device. Off by default because CDNs rotate IPs constantly and this gets noisy. New-country, threat, and bypass alerts are always on.",
 
+  "host_check": true,
+  "_host_check": "Anti-DNS-rebinding protection. When true (default), NetWatch only answers requests whose Host header is this LAN box (localhost, a private/link-local IP, a *.local or single-label name, or an entry in allow_hosts). This stops a malicious web page from rebinding a public domain to your Pi and reading your device inventory. Set false only if it blocks a legitimate way you reach the dashboard.",
+
+  "allow_hosts": [],
+  "_allow_hosts": "Extra Host names to accept when host_check is on - add the fully-qualified name here if you reach the dashboard by a public/DNS hostname (e.g. \"netwatch.example.com\"). Plain LAN IPs and single-label/.local names already work without listing them.",
+
   "weekly_digest": false,
-  "_weekly_digest": "If true (and email is configured below), emails a weekly summary - top talkers, countries, alert counts, and threat hits from the past 7 days. The first digest arrives one week after enabling.",
+  "_weekly_digest": "If true (and email is configured below), emails a weekly summary - top talkers, countries, alert counts, threat hits, and a deduplicated list of every DNS server/resolver devices tried to reach (a ready-made firewall/ACL blocklist) from the past 7 days. The same summary is always available on-screen via the header's 'digest' button. The first email digest arrives one week after enabling.",
 
   "notify": {
     "_comment": "Remove any channel you don't want. In-app alerts (the bell) always work regardless of these.",

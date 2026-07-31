@@ -12,3 +12,6 @@ netwatch_threat_cache.json
 
 # Your local config may contain notification credentials — never commit it
 netwatch.conf
+
+# Your device-name map is personal to your network — keep the .example, not this
+netwatch_names.json

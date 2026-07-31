@@ -73,11 +73,6 @@ DIGEST_STATE = os.path.join(HERE, "netwatch_digest.json")
 
 STALE_AFTER = 10       # seconds since last packet -> flow shown as fading
 DROP_AFTER = 120       # seconds since last packet -> flow removed
-INBOUND_RETAIN = 6 * 3600  # keep inbound-connection records visible this long
-                           # (6h). An inbound hit is a security EVENT, not a live
-                           # flow: it should linger on the counter/panel like its
-                           # alert does, not vanish in 2 minutes.
-INBOUND_MAX = 400      # cap on retained inbound records (drop oldest beyond this)
 GEO_RETRY = 60
 CACHE_SAVE_EVERY = 30
 CAP_BYTES = 512        # bytes captured per frame (enough for headers + most SNI)
@@ -85,6 +80,7 @@ THREAT_REFRESH = 6 * 3600
 DB_FLUSH_EVERY = 20
 RETAIN_DAYS = 30
 MAX_ALERTS = 300
+THREAT_CACHE_MAX = 50000   # cap the threat-match memo cache (bounds long-run memory)
 
 # Public resolvers commonly hardcoded by devices to bypass a local DNS filter.
 DOH_IPS = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9",
@@ -345,14 +341,23 @@ def _merge_flow(key, ent, now):
             f["host"] = ent["host"]
 
 
+_dns_target_q = []   # (server, kind, ts) bypass targets waiting to be persisted
+
+
 def _mark_bypass(dev, kind, detail):
+    now = time.time()
     b = BYPASS.get(dev)
     if not b:
         b = {"types": set(), "last": 0, "detail": ""}
         BYPASS[dev] = b
     b["types"].add(kind)
-    b["last"] = time.time()
+    b["last"] = now
     b["detail"] = detail
+    # Record the resolver/server so the digest can list every DNS destination
+    # devices tried to reach (deduped there), for firewall/ACL blocklisting.
+    # This is logged for EVERY event, independent of the capped bypass alerts.
+    if detail:
+        _dns_target_q.append((detail, kind, now))
 
 
 def _record_inbound(dev, rem, dport):
@@ -546,12 +551,8 @@ def _prune(now):
     with LOCK:
         for k in [k for k, f in FLOWS.items() if now - f["last"] > DROP_AFTER]:
             del FLOWS[k]
-        for k in [k for k, v in INBOUND.items() if now - v["last"] > INBOUND_RETAIN]:
+        for k in [k for k, v in INBOUND.items() if now - v["last"] > DROP_AFTER]:
             del INBOUND[k]
-        if len(INBOUND) > INBOUND_MAX:      # bound memory: keep the most recent
-            for k, _ in sorted(INBOUND.items(), key=lambda kv: kv[1]["last"]
-                               )[:len(INBOUND) - INBOUND_MAX]:
-                del INBOUND[k]
 
 
 # ----------------------------------------------------------------------------
@@ -586,6 +587,13 @@ def demo_loop():
         # An unsolicited inbound connection attempt (e.g. hitting a forwarded port)
         _record_inbound("192.168.1.20", "185.220.101.5", 22)
         _record_inbound("192.168.1.20", "185.220.101.5", 22)
+        # DNS-bypass demo: one device reaches SEVERAL resolvers. This shows both
+        # the per-device alert cap (many attempts -> only 2 alerts) and the
+        # deduplicated DNS-server list in the digest (every server still logged).
+        for srv in ("8.8.8.8", "1.1.1.1", "9.9.9.9", "208.67.222.222"):
+            _mark_bypass("192.168.1.31", "plaintext-dns", srv)
+        _mark_bypass("192.168.1.57", "doh", "dns.google")
+        _mark_bypass("192.168.1.57", "doh", "cloudflare-dns.com")
     i = 0
     # deterministic pseudo-random without Math.random/time-seed issues
     while True:
@@ -598,6 +606,15 @@ def demo_loop():
         if rem == "8.8.8.8":                       # echo-dot doing its own DoH
             with LOCK:
                 _mark_bypass(dev, "doh", "dns.google")
+        # One device keeps reaching new resolvers over time: shows the 2-alert
+        # cap (only 2 shown, rest suppressed) while every server is still logged
+        # to the digest's DNS-server list.
+        if i % 20 == 0:
+            rr = ("8.8.8.8", "1.1.1.1", "9.9.9.9", "208.67.222.222",
+                  "94.140.14.14")
+            with LOCK:
+                _mark_bypass("192.168.1.31", "plaintext-dns",
+                             rr[(i // 20) % len(rr)])
         CAP_STATE["pkts"] = i
         CAP_STATE["pps"] = 12.0
         time.sleep(0.35)
@@ -876,6 +893,10 @@ def threat_match(ip):
                     break
         except ValueError:
             pass
+    # Bound the cache: on an always-on service the set of distinct remote IPs
+    # grows forever, so clear (and re-memoize on demand) once it gets large.
+    if len(_threat_verdict) >= THREAT_CACHE_MAX:
+        _threat_verdict.clear()
     _threat_verdict[ip] = hit
     return hit or None
 
@@ -897,6 +918,10 @@ def db_connect():
     con.execute("""CREATE TABLE IF NOT EXISTS alerts(
         ts REAL, level TEXT, kind TEXT, dev TEXT, dev_name TEXT,
         rem TEXT, host TEXT, msg TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS dns_targets(
+        server TEXT PRIMARY KEY, kind TEXT, first REAL, last REAL,
+        hits INTEGER)""")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_dns_last ON dns_targets(last)")
     con.commit()
     return con
 
@@ -941,6 +966,8 @@ def db_worker():
                     f["up"], f["down"]) for f in FLOWS.values()]
             pending = list(_alert_persist_q)
             _alert_persist_q.clear()
+            dns_pending = list(_dns_target_q)
+            _dns_target_q.clear()
         rows = []
         for dev, name, rem, host, g, first, last, up, down in raw:
             gg = g if g.get("status") == "ok" else {}
@@ -962,10 +989,17 @@ def db_worker():
                     " VALUES(?,?,?,?,?,?,?,?)",
                     (a["ts"], a["level"], a["kind"], a["dev"], a["dev_name"],
                      a["rem"], a["host"], a["msg"]))
+            for server, kind, ts in dns_pending:
+                # dedup by server: keep first-seen time, bump last + hit count
+                con.execute(
+                    "INSERT INTO dns_targets(server,kind,first,last,hits)"
+                    " VALUES(?,?,?,?,1) ON CONFLICT(server) DO UPDATE SET"
+                    " last=excluded.last, hits=hits+1", (server, kind, ts, ts))
             if now - last_prune > 3600:
                 cutoff = now - RETAIN_DAYS * 86400
                 con.execute("DELETE FROM sessions WHERE last < ?", (cutoff,))
                 con.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
+                con.execute("DELETE FROM dns_targets WHERE last < ?", (cutoff,))
                 last_prune = now
             con.commit()
         except Exception as e:
@@ -998,6 +1032,8 @@ def db_history(since, dev=None, limit=500):
 
 _alert_persist_q = []     # alerts waiting to be written by db_worker
 _alert_dedup = set()      # (kind, dev, key) already alerted this run
+_bypass_alert_count = {}  # dev -> number of DNS-bypass alerts shown this window
+BYPASS_ALERT_MAX = 2      # cap DNS-bypass alerts per device (logging is unaffected)
 
 
 def _emit_alert(level, kind, dev, rem, host, msg):
@@ -1099,6 +1135,14 @@ def _fire(kind, dev, key, host, cc, names, learning, msg):
     dd = (kind, dev, key)
     if dd in _alert_dedup:
         return
+    # DNS-bypass alerts are capped per device so one chatty device (hitting many
+    # resolvers) can't flood the feed. Everything is still LOGGED normally (DB
+    # sessions + the DNS-server digest list); only the visible/notified alerts
+    # are limited.
+    if kind.startswith("bypass_"):
+        if _bypass_alert_count.get(dev, 0) >= BYPASS_ALERT_MAX:
+            return
+        _bypass_alert_count[dev] = _bypass_alert_count.get(dev, 0) + 1
     _alert_dedup.add(dd)
     _emit_alert(level, kind, dev, rem_field, host, msg)
 
@@ -1207,9 +1251,12 @@ def digest_data(days):
                            "FROM sessions WHERE last>=?", (since,)).fetchall()
         alerts = con.execute("SELECT kind FROM alerts WHERE ts>=?",
                              (since,)).fetchall()
+        dns_rows = con.execute(
+            "SELECT server,kind,hits FROM dns_targets WHERE last>=? "
+            "ORDER BY hits DESC, server", (since,)).fetchall()
         con.close()
     except Exception:
-        sess, alerts = [], []
+        sess, alerts, dns_rows = [], [], []
     dev_b, dest_b, countries, threats = {}, {}, set(), []
     total = 0
     for dev, dname, rem, host, cc, country, up, down, threat in sess:
@@ -1238,11 +1285,17 @@ def digest_data(days):
     top_dst = sorted(({"host": v["host"], "cc": v["cc"], "up": v["up"],
                        "down": v["down"], "total": v["up"] + v["down"]}
                       for v in dest_b.values()), key=lambda x: -x["total"])[:10]
+    # Deduplicated list of DNS servers/resolvers devices tried to reach (for
+    # blocklisting at a firewall/ACL). SQLite PRIMARY KEY already dedups by
+    # server; label the kind in plain English.
+    dns_targets = [{"server": s,
+                    "kind": "encrypted DNS/DoH" if k == "doh" else "external DNS",
+                    "hits": h} for (s, k, h) in dns_rows]
     return {"days": days, "total": total, "devices": len(dev_b),
             "dests": len(dest_b), "countries": len(countries),
             "top_devices": top_dev, "top_dests": top_dst,
             "alerts_total": len(alerts), "alerts_by_kind": by_kind,
-            "threats": threats}
+            "threats": threats, "dns_targets": dns_targets}
 
 
 def build_digest():
@@ -1264,6 +1317,13 @@ def build_digest():
         L.append("Threat-list hits (%d):" % len(d["threats"]))
         for t in d["threats"][:15]:
             L.append("  %s -> %s (%s)" % (t["dev"], t["rem"], t["country"]))
+    if d.get("dns_targets"):
+        L.append("")
+        L.append("DNS servers devices tried to reach (%d) - candidates to block "
+                 "at your firewall/ACL:" % len(d["dns_targets"]))
+        for t in d["dns_targets"]:
+            L.append("  %-24s %-18s (%d hits)"
+                     % (t["server"], t["kind"], t["hits"]))
     L.append("")
     L.append("- NetWatch")
     return "\n".join(L)
@@ -1474,7 +1534,52 @@ def snapshot_worker():
 # ----------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
+    def _host_ok(self):
+        """Anti-DNS-rebinding: only serve requests whose Host is this LAN box, not
+        an attacker-controlled public name that rebinds to our IP. Allows
+        localhost, private/loopback/link-local IP literals, *.local (mDNS), plain
+        single-label hostnames (can't be public domains), and any name in
+        CONF['allow_hosts']. Set CONF['host_check']=false to disable entirely."""
+        if not CONF.get("host_check", True):
+            return True
+        host = (self.headers.get("Host") or "").strip().lower()
+        host = host.rsplit(":", 1)[0].strip("[]") if host else ""
+        if not host:
+            return False
+        if host == "localhost" or host in {h.lower() for h in
+                                           CONF.get("allow_hosts", [])}:
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            pass
+        return host.endswith(".local") or "." not in host
+
+    def _csrf_ok(self):
+        """CSRF guard for state-changing POSTs. Requires the custom header the
+        dashboard sends (a cross-site <form> can't set it, and a cross-site fetch
+        that does triggers a CORS preflight we never approve), plus a same-origin
+        Origin check as defense in depth."""
+        if self.headers.get("X-NetWatch") != "1":
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            from urllib.parse import urlparse as _up
+            o = _up(origin).netloc.rsplit(":", 1)[0].strip("[]").lower()
+            h = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+            if o and o != h:
+                return False
+        return True
+
+    def _deny(self, code=403):
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
+        if not self._host_ok():
+            self._deny(); return
         from urllib.parse import urlparse, parse_qs
         u = urlparse(self.path)
         if u.path == "/" or u.path.startswith("/index"):
@@ -1503,6 +1608,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if not self._host_ok() or not self._csrf_ok():
+            self._deny(); return
         if self.path == "/quit":
             body = b'{"ok":true}'
             self.send_response(200)
@@ -1515,6 +1622,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 ALERTS.clear()
                 _alert_dedup.clear()   # let repeats re-alert after a manual clear
+                _bypass_alert_count.clear()   # reset per-device bypass alert cap
             try:
                 con = db_connect(); con.execute("DELETE FROM alerts")
                 con.commit(); con.close()
@@ -1646,6 +1754,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .inb .nm{font-weight:600}
   .inb .meta{color:var(--text-secondary);font-size:12px;margin-top:1px}
   .inb .ipline{color:var(--text-muted);font-size:11px;font-family:Consolas,ui-monospace,monospace;margin-top:1px}
+  .dg-note{color:var(--text-muted);font-size:11px;padding:2px 14px 6px}
   #alertClear{font-size:11px !important;border:1px solid var(--border) !important;border-radius:6px;
     padding:3px 9px !important;margin-right:8px;color:var(--text-secondary) !important}
   #alertClear:hover{border-color:var(--bad) !important;color:var(--text-primary) !important}
@@ -2056,7 +2165,7 @@ const alertsPanel=document.getElementById("alerts");
 document.getElementById("alertBtn").addEventListener("click",()=>alertsPanel.classList.toggle("open"));
 document.getElementById("alertClose").addEventListener("click",()=>alertsPanel.classList.remove("open"));
 document.getElementById("alertClear").addEventListener("click",async()=>{
-  try{await fetch("/alerts/clear",{method:"POST"});}catch(e){}
+  try{await fetch("/alerts/clear",{method:"POST",headers:{"X-NetWatch":"1"}});}catch(e){}
   renderAlerts([]);
   document.getElementById("alertN").style.display="none";
   document.getElementById("alertBtn").classList.remove("has");
@@ -2100,6 +2209,13 @@ async function loadDigest(){
     h+=d.threats.slice(0,20).map(t=>'<div class="row flag"><div class="nm">'+esc(t.dev)
       +" &rarr; "+esc(t.rem)+'</div><div class="ipline">'+esc(t.country||"")+"</div></div>").join("");
   }
+  if(d.dns_targets&&d.dns_targets.length){
+    h+='<div class="section-hd"><span>DNS servers to block ('+d.dns_targets.length+")</span></div>";
+    h+='<div class="dg-note">Resolvers devices tried to reach &mdash; block these at your firewall/ACL.</div>';
+    h+=d.dns_targets.map(t=>'<div class="row"><div class="top">'
+      +'<div class="nm">'+esc(t.server)+'</div><div class="cnt">'+t.hits+"</div></div>"
+      +'<div class="ipline">'+esc(t.kind)+"</div></div>").join("");
+  }
   document.getElementById("digestBody").innerHTML=h;
 }
 document.getElementById("digestBtn").addEventListener("click",()=>{
@@ -2116,7 +2232,7 @@ document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",
 
 let quitting=false;
 document.getElementById("quitBtn").addEventListener("click",async()=>{
-  quitting=true;try{await fetch("/quit",{method:"POST"});}catch(e){}
+  quitting=true;try{await fetch("/quit",{method:"POST",headers:{"X-NetWatch":"1"}});}catch(e){}
   document.getElementById("stopped").style.display="grid";});
 
 async function tick(){if(quitting)return;
@@ -2172,6 +2288,7 @@ def main():
 
     if args.demo:
         print("  DEMO mode - synthesizing traffic, no capture")
+        CONF["learn_minutes"] = 0   # skip warm-up so alerts show immediately
         threading.Thread(target=demo_loop, name="demo", daemon=True).start()
     else:
         if os.name != "posix":

@@ -28,11 +28,12 @@ Pure Python 3 standard library — **nothing to install**.
 
 ## Screenshots
 
-| World Map | Alerts feed |
+| Devices & destinations | Alerts feed |
 |---|---|
-| ![map](docs/NetWatch-Map.png) | ![alerts](docs/netwatch-alerts.png) |
+| ![devices](docs/netwatch-devices.png) | ![alerts](docs/netwatch-alerts.png) |
 
-*The main view's left panel is a live world map. Devices are color-coded with upload/download
+*The main view's left panel is a live world map (add a screenshot from your own
+deployment for the best hero image). Devices are color-coded with upload/download
 totals and badges for threats or Pi-hole bypass; the alerts feed is severity-coded.*
 
 ---
@@ -43,12 +44,21 @@ totals and badges for threats or Pi-hole bypass; the alerts feed is severity-cod
 - **Real endpoints + hostnames** (TLS SNI), not just DNS domains — catches traffic
   that never does a DNS lookup (hardcoded IPs, IoT phone-homes)
 - **Alerts** on a device reaching a new country, hitting a known-bad IP, or
-  bypassing your Pi-hole — in-app plus optional phone push (ntfy), webhook, or email
+  bypassing your Pi-hole — in-app plus optional phone push (ntfy), webhook, or email.
+  DNS-bypass alerts are capped at **2 per device** so one chatty device can't flood
+  the feed (every attempt is still logged — see the digest below)
 - **Threat-intelligence flagging** against Tor exit nodes, FireHOL level-1, and
   Spamhaus DROP (auto-refreshed); flagged destinations turn red
+- **Digest** (on-screen panel + optional weekly email) with top talkers, countries,
+  alert counts, threat hits, and a **deduplicated list of every DNS server/resolver
+  devices tried to reach** — a ready-made blocklist for your firewall or ACLs
 - **History** saved to SQLite with a 24-hour look-back view; 30-day retention
 - **Data volume** (↑ upload / ↓ download) per device and destination
 - **Pi-hole bypass detection** — flags devices doing their own external DNS or DoH
+- **Friendly device names** — reverse-DNS/MAC-vendor by default, plus an optional
+  manual name map (any switch/controller that can export a client list works)
+- **Unsolicited-inbound detection** — flags TCP connections opened *to* your devices
+  from the internet
 - Per-device map filtering, a searchable side panel, and a dark themed UI
 
 ## How it works (and its limits)
@@ -59,7 +69,8 @@ totals and badges for threats or Pi-hole bypass; the alerts feed is severity-cod
   and DNS answers. **No payloads are stored.** The only data leaving your network
   is the set of remote IPs sent to [ip-api.com](https://ip-api.com) for
   geolocation (cached locally).
-- It records **outbound** flows (a LAN device → a public IP).
+- It records **outbound** flows (a LAN device → a public IP), and separately flags
+  **unsolicited inbound** TCP connections opened *to* your devices from the internet.
 - HTTPS/TLS-over-TCP usually reveals the hostname via SNI. QUIC (UDP/443) is
   encrypted, so those show the real IP + reverse-DNS but not always a clean host.
 - Under a fully saturated gigabit transfer the Pi may drop some mirrored packets
@@ -69,8 +80,10 @@ totals and badges for threats or Pi-hole bypass; the alerts feed is severity-cod
 
 - A Linux capture box with two network paths (a Raspberry Pi 4/5 is perfect: wired
   Ethernet for the mirror, Wi-Fi for its normal connection)
-- A **managed switch with port mirroring** (SPAN). Most managed switches have it,
-  including TP-Link Omada *Smart* switches.
+- A **managed switch with port mirroring** (also called **SPAN** or a
+  **monitor/mirror port**). This is the one hard requirement — it's what lets the
+  Pi see other devices' traffic. Most managed/"smart" switches from any vendor
+  support it; consult your switch's manual for the exact menu name.
 - Python 3.9+ and root (raw packet capture)
 
 ---
@@ -91,10 +104,22 @@ second source port.
 
 ### 2. Enable port mirroring on the switch
 
-On a TP-Link Omada switch, in the controller: **Devices → (your switch) → Ports →** click the
-monitor port → enable **Profile Overrides → Operation: Mirroring**, choose the
-source port(s), set direction **Both**, **Apply**. (Other managed switches have an
-equivalent "port mirror" / "SPAN" setting.)
+Every managed switch calls this something slightly different — **port mirroring**,
+**SPAN**, or a **monitor session** — but the concept is identical: pick a
+**destination/monitor port** (where the Pi plugs in) and one or more **source
+ports** to copy, and set the direction to **both** (ingress + egress). Apply, and
+the Pi's mirror NIC will start seeing copies of that traffic.
+
+General steps (adapt to your switch's UI/CLI):
+
+1. Find the mirroring/SPAN feature in your switch's management interface.
+2. Set the **destination** (monitor) port to the port the Pi's Ethernet is on.
+3. Set the **source** port(s) to the uplink identified in step 1 (plus any
+   inter-switch link).
+4. Set direction to **both**, then apply/save.
+
+If you're not sure whether your switch supports it, look for "mirror," "SPAN," or
+"monitor" in its manual. Unmanaged switches do **not** support this.
 
 ### 3. Put it on the Pi
 
@@ -148,6 +173,31 @@ The config stays on your Pi and is read locally.
 Alert severities: **critical** (threat-list hit), **warning** (Pi-hole bypass),
 **notice** (new country), **info** (new destination, if enabled).
 
+To keep the feed readable, **DNS-bypass alerts are limited to 2 per device** per
+alerts window (they reset when you clear alerts). This only limits the *alerts* —
+every bypass attempt is still recorded and rolled up in the digest.
+
+### 7. The digest & the DNS-server blocklist
+
+Click **☰ digest** in the header for an on-screen summary of the last 24 hours /
+7 / 30 days: top talkers, destinations, countries, alert counts, threat hits, and
+a **deduplicated list of every DNS server or resolver your devices tried to reach**
+while bypassing your sanctioned DNS. That list is exactly what you'd paste into a
+firewall rule or ACL/IP group to block them. Enable `weekly_digest` (with email
+configured) in `netwatch.conf` to also receive this as a weekly email.
+
+### 8. Naming your devices (optional)
+
+By default NetWatch names each device by reverse-DNS (the hostname it registered
+via DHCP), falling back to its MAC vendor, then its IP. To show your own friendly
+names instead — handy for IoT gadgets that announce nothing — copy
+[`netwatch_names.json.example`](netwatch_names.json.example) to `netwatch_names.json`
+next to the script and map each device's **MAC** (any spelling) or **IP** to a
+name. These take top priority. A MAC key is best since it survives IP changes.
+Adding a name applies within a few seconds; removing one needs a restart. If your
+switch or controller can export a client list, you can build this file from that
+export rather than typing names by hand.
+
 ---
 
 ## Responsible use
@@ -157,6 +207,21 @@ network you own or administer, and where users have appropriate notice.** Captur
 others' network traffic without authorization may be illegal in your jurisdiction.
 NetWatch deliberately stores only connection metadata (addresses, ports, hostnames)
 and never packet contents, but you are responsible for using it lawfully.
+
+## Security & access
+
+The dashboard is an **unauthenticated LAN service** — anyone who can reach
+`http://<pi>:8339` can view it. That's by design for a home network, but be aware:
+
+- **Keep it on a trusted LAN.** Don't port-forward it to the internet or expose it
+  on an untrusted/guest network. If you need remote access, reach it over a VPN
+  (e.g. Tailscale/WireGuard), not a public port.
+- **Built-in protections.** The action endpoints (clear alerts, quit) require a
+  same-origin request header, so a malicious web page a LAN user visits can't fire
+  them cross-site (CSRF). All endpoints also validate the `Host` header to block
+  DNS-rebinding attempts against the read APIs. If you reach the dashboard by a
+  public DNS name, add it to `allow_hosts` in `netwatch.conf`; `host_check` can be
+  turned off there if needed (not recommended).
 
 ## License
 

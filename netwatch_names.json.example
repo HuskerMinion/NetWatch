@@ -1,0 +1,8 @@
+{
+  "_comment": "Rename to netwatch_names.json (next to netwatch.py) to give devices friendly names. Keys are a device MAC (any spelling: aa:bb:cc:dd:ee:ff, AA-BB-CC-DD-EE-FF, or aabbccddeeff) OR a LAN IP. Values are the name you want shown. A MAC key is best because it survives DHCP IP changes. These names take priority over reverse-DNS and MAC-vendor guesses. Keys starting with _ and blank values are ignored. Adding a name takes effect within ~5s with no restart; removing one needs a restart.",
+
+  "aa:bb:cc:dd:ee:ff": "Starlord",
+  "11-22-33-44-55-66": "Garage Cam",
+  "192.168.34.50": "Living Room TV",
+  "192.168.34.60": "Kids iPad"
+}
