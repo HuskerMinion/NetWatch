@@ -59,7 +59,9 @@ Pi-hole bypass; the alerts feed is severity-coded.*
   devices tried to reach** — a ready-made blocklist for your firewall or ACLs
 - **History** saved to SQLite with a 24-hour look-back view; 30-day retention
 - **Data volume** (↑ upload / ↓ download) per device and destination
-- **Pi-hole bypass detection** — flags devices doing their own external DNS or DoH
+- **Pi-hole bypass detection** — flags devices doing their own external DNS,
+  DoT (port 853), or DoH; the digest's **DNS list** tab is a cumulative, deduplicated
+  blocklist split into firewall-blockable IPs and Pi-hole-blockable domains
 - **Friendly device names** — reverse-DNS/MAC-vendor by default, plus an optional
   manual name map (any switch/controller that can export a client list works)
 - **Unsolicited-inbound detection** — flags TCP connections opened *to* your devices

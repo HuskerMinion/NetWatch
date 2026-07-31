@@ -57,8 +57,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.07.31"   # shown in the header + startup log so you can confirm
-                         # which build is actually running after a deploy
+VERSION = "2026.07.31.2"  # date + same-day build number, so successive changes on
+                          # one day are distinguishable. Shown in the header +
+                          # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
 GEO_BATCH_URL = ("http://ip-api.com/batch?fields=status,message,country,"
                  "countryCode,regionName,city,lat,lon,isp,org,query")
@@ -434,6 +435,15 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new, mac_new, inbound_new):
                 bypass_new.append((pk["src"], "plaintext-dns", pk["dst"]))
         except ValueError:
             pass
+    elif pk["dport"] == 853:                       # DNS-over-TLS (or DoQ over UDP)
+        try:
+            sa = ipaddress.ip_address(pk["src"])
+            da = ipaddress.ip_address(pk["dst"])
+            if (pk["src"] not in IGNORE and is_private_lan(sa) and da.is_global
+                    and pk["dst"] not in PIHOLE_IPS):
+                bypass_new.append((pk["src"], "dot", pk["dst"]))
+        except ValueError:
+            pass
 
     c = classify(pk["src"], pk["dst"])
     if not c:
@@ -597,7 +607,8 @@ def demo_loop():
         # deduplicated DNS-server list in the digest (every server still logged).
         for srv in ("8.8.8.8", "1.1.1.1", "9.9.9.9", "208.67.222.222"):
             _mark_bypass("192.168.1.31", "plaintext-dns", srv)
-        _mark_bypass("192.168.1.57", "doh", "dns.google")
+        _mark_bypass("192.168.1.44", "dot", "94.140.14.14")     # DoT to an IP
+        _mark_bypass("192.168.1.57", "doh", "dns.google")       # DoH by hostname
         _mark_bypass("192.168.1.57", "doh", "cloudflare-dns.com")
     i = 0
     # deterministic pseudo-random without Math.random/time-seed issues
@@ -1158,8 +1169,7 @@ def _alert_pass(warmup):
                     continue
                 _fire("bypass_" + t, dev, server, "", None, names, learning,
                       msg=("device using its own %s (%s), bypassing your Pi-hole"
-                           % ("encrypted DNS/DoH" if t == "doh" else "external DNS",
-                              server)))
+                           % (_bypass_label(t), server)))
 
 
 def _fire(kind, dev, key, host, cc, names, learning, msg):
@@ -1354,10 +1364,17 @@ def digest_data(days):
             "threats": threats, "dns_targets": dns_blocklist()}
 
 
+def _bypass_label(kind):
+    return {"doh": "encrypted DNS/DoH", "dot": "encrypted DNS/DoT",
+            "plaintext-dns": "external DNS"}.get(kind, "external DNS")
+
+
 def dns_blocklist():
     """The full cumulative list of every DNS resolver devices have tried to reach
-    (NOT time-windowed) — a ready-to-paste firewall/ACL blocklist. Its own tiny,
-    instant query so the DNS view never waits on the traffic aggregation."""
+    (NOT time-windowed) — a ready-to-paste blocklist. Its own tiny, instant query
+    so the DNS view never waits on the traffic aggregation. Each entry is tagged
+    block_at='firewall' (it's an IP → block in an ACL/IP group) or 'pihole' (it's
+    a hostname, e.g. a DoH endpoint → block as a domain in Pi-hole)."""
     try:
         con = db_connect()
         rows = con.execute("SELECT server, kind, hits FROM dns_targets "
@@ -1365,9 +1382,16 @@ def dns_blocklist():
         con.close()
     except Exception:
         rows = []
-    return [{"server": s,
-             "kind": "encrypted DNS/DoH" if k == "doh" else "external DNS",
-             "hits": h} for (s, k, h) in rows]
+    out = []
+    for s, k, h in rows:
+        try:
+            ipaddress.ip_address(s)
+            at = "firewall"
+        except ValueError:
+            at = "pihole"
+        out.append({"server": s, "kind": _bypass_label(k), "hits": h,
+                    "block_at": at})
+    return out
 
 
 def build_digest():
@@ -2295,6 +2319,27 @@ async function loadDigest(){
   }
   document.getElementById("digestBody").innerHTML=h;
 }
+function dnsSection(title,note,id,items){
+  if(!items.length)
+    return '<div class="section-hd"><span>'+title+' (0)</span></div>'
+      +'<div class="empty">None seen.</div>';
+  return '<div class="section-hd"><span>'+title+' ('+items.length+')</span></div>'
+    +'<div class="dg-note">'+note+'</div>'
+    +'<button class="dg-copy" id="copy_'+id+'">Copy all</button>'
+    +items.map(t=>'<div class="row"><div class="top">'
+      +'<div class="nm">'+esc(t.server)+'</div><div class="cnt">'+t.hits+"</div></div>"
+      +'<div class="ipline">'+esc(t.kind)+"</div></div>").join("");
+}
+function wireCopy(id,items){
+  const btn=document.getElementById("copy_"+id); if(!btn)return;
+  const text=items.map(t=>t.server).join("\n");
+  btn.addEventListener("click",()=>{
+    const done=()=>{btn.textContent="Copied!";setTimeout(()=>{btn.textContent="Copy all";},1500);};
+    if(navigator.clipboard&&navigator.clipboard.writeText)
+      navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(text,done,btn));
+    else fallbackCopy(text,done,btn);
+  });
+}
 async function loadDNS(){
   const body=document.getElementById("digestBody");
   body.innerHTML='<div class="empty">Loading&hellip;</div>';
@@ -2304,23 +2349,15 @@ async function loadDNS(){
   const list=d.dns_targets||[];
   let h='<div class="dg-hero"><b>'+list.length+'</b><small>DNS servers seen &middot; cumulative blocklist</small></div>';
   if(!list.length){
-    body.innerHTML=h+'<div class="empty">No DNS-bypass activity recorded yet. As devices try their own resolvers, they show up here.</div>';
+    body.innerHTML=h+'<div class="empty">No DNS-bypass activity recorded yet. As devices try their own resolvers (plaintext, DoT or DoH), they show up here.</div>';
     return;
   }
-  h+='<div class="dg-note">Every resolver your devices tried to reach. Paste these into a firewall rule or ACL/IP group to block them.</div>';
-  h+='<button class="dg-copy" id="dnsCopy">Copy all</button>';
-  h+=list.map(t=>'<div class="row"><div class="top">'
-    +'<div class="nm">'+esc(t.server)+'</div><div class="cnt">'+t.hits+"</div></div>"
-    +'<div class="ipline">'+esc(t.kind)+"</div></div>").join("");
+  const ips=list.filter(t=>t.block_at==="firewall");
+  const doms=list.filter(t=>t.block_at==="pihole");
+  h+=dnsSection("Block at firewall / ACL","IPs your devices reached directly (plaintext DNS, DoT, or DoH-by-IP). Add these to an ACL / IP group.","fw",ips);
+  h+=dnsSection("Block at Pi-hole","DoH/DoT hostnames &mdash; block these as domains in Pi-hole (the firewall can't match them by IP).","ph",doms);
   body.innerHTML=h;
-  const text=list.map(t=>t.server).join("\n");
-  const btn=document.getElementById("dnsCopy");
-  btn.addEventListener("click",()=>{
-    const done=()=>{btn.textContent="Copied!";setTimeout(()=>{btn.textContent="Copy all";},1500);};
-    if(navigator.clipboard&&navigator.clipboard.writeText){
-      navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(text,done,btn));
-    } else fallbackCopy(text,done,btn);
-  });
+  wireCopy("fw",ips); wireCopy("ph",doms);
 }
 function fallbackCopy(text,done,btn){
   const ta=document.createElement("textarea");ta.value=text;ta.style.position="fixed";ta.style.opacity="0";
