@@ -57,7 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.07.31.2"  # date + same-day build number, so successive changes on
+VERSION = "2026.07.31.3"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -74,9 +74,15 @@ OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
 OUI_REFRESH = 30 * 86400
 DIGEST_INTERVAL = 7 * 86400
 DIGEST_STATE = os.path.join(HERE, "netwatch_digest.json")
+NAMES_FILE = os.path.join(HERE, "netwatch_names.json")  # manual MAC/IP -> name map
 
 STALE_AFTER = 10       # seconds since last packet -> flow shown as fading
 DROP_AFTER = 120       # seconds since last packet -> flow removed
+INBOUND_RETAIN = 6 * 3600  # keep inbound-connection records visible this long (6h).
+                           # An inbound hit is a security EVENT, not a live flow: it
+                           # should linger on the counter/panel like its alert does,
+                           # not vanish in 2 minutes.
+INBOUND_MAX = 400      # cap on retained inbound records (drop oldest beyond this)
 GEO_RETRY = 60
 CACHE_SAVE_EVERY = 30
 CAP_BYTES = 512        # bytes captured per frame (enough for headers + most SNI)
@@ -107,6 +113,7 @@ LOCK = threading.RLock()   # reentrant: a thread may re-acquire without deadlock
 FLOWS = {}      # (dev,rem) -> {dev,rem,proto,ports:set,first,last,pkts,up,down,host}
 GEO = {}        # ip -> {status, ts, ...}
 DEV_NAMES = {}  # lan_ip -> hostname
+NAMES_OVERRIDE = {}  # normalized MAC or IP -> user-supplied friendly name (top priority)
 IPDOMAIN = {}   # public_ip -> domain (learned from sniffed DNS answers)
 BYPASS = {}     # dev_ip -> {"type": set(), "last": ts, "detail": str}
 SEEN = {"dev_country": set(), "dev_rem": set()}   # baselines loaded from DB
@@ -566,8 +573,12 @@ def _prune(now):
     with LOCK:
         for k in [k for k, f in FLOWS.items() if now - f["last"] > DROP_AFTER]:
             del FLOWS[k]
-        for k in [k for k, v in INBOUND.items() if now - v["last"] > DROP_AFTER]:
+        for k in [k for k, v in INBOUND.items() if now - v["last"] > INBOUND_RETAIN]:
             del INBOUND[k]
+        if len(INBOUND) > INBOUND_MAX:      # bound memory: keep the most recent
+            for k, _ in sorted(INBOUND.items(), key=lambda kv: kv[1]["last"]
+                               )[:len(INBOUND) - INBOUND_MAX]:
+                del INBOUND[k]
 
 
 # ----------------------------------------------------------------------------
@@ -640,18 +651,83 @@ def demo_loop():
 # Reverse DNS for LAN device names (best effort, via the network's resolver)
 # ----------------------------------------------------------------------------
 
+def _norm_mac(m):
+    """Normalize any common MAC spelling to lowercase colon form aa:bb:cc:dd:ee:ff."""
+    if not m:
+        return ""
+    h = "".join(c for c in m.lower() if c in "0123456789abcdef")
+    if len(h) != 12:
+        return m.strip().lower()          # not a MAC; return as-is (e.g. an IP)
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2))
+
+
+def load_names_override():
+    """Load the optional netwatch_names.json (MAC or IP -> friendly name). Keys
+    that look like MACs are normalized so any spelling matches. Missing file is
+    fine; a malformed file is logged and ignored."""
+    try:
+        with open(NAMES_FILE) as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print("names: could not read %s (%s) - ignoring" % (NAMES_FILE, e),
+              file=sys.stderr)
+        return {}
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k.startswith("_") or not isinstance(v, str) or not v.strip():
+                continue                  # skip comment keys / blank values
+            out[_norm_mac(k)] = v.strip()
+    return out
+
+
+def _override_name(ip, macs):
+    """Friendly name for a device from the manual override map: match its MAC
+    first (survives IP changes), then its IP. '' if none."""
+    mac = macs.get(ip)
+    if mac:
+        n = NAMES_OVERRIDE.get(_norm_mac(mac))
+        if n:
+            return n
+    return NAMES_OVERRIDE.get(ip, "")
+
+
 def name_worker():
+    global NAMES_OVERRIDE
+    ov_mtime = None
     while True:
+        # Hot-reload the manual names file whenever it changes (no restart needed
+        # to ADD a name; removing one still needs a restart).
+        try:
+            m = os.path.getmtime(NAMES_FILE)
+        except OSError:
+            m = None
+        if m != ov_mtime:
+            NAMES_OVERRIDE = load_names_override()
+            ov_mtime = m
         with LOCK:
-            unknown = list({f["dev"] for f in FLOWS.values()} - set(DEV_NAMES))
-        for ip in unknown:
-            name = None
+            devs = {f["dev"] for f in FLOWS.values()}
+            devs |= {v["dev"] for v in INBOUND.values()}
+            known = dict(DEV_NAMES)
+            macs = dict(DEV_MAC)
+        for ip in devs:
+            ov = _override_name(ip, macs)
+            if ov:                        # manual name wins over everything
+                if known.get(ip) != ov:
+                    with LOCK:
+                        DEV_NAMES[ip] = ov
+                continue
+            if ip in known:               # already resolved once — don't re-hammer DNS
+                continue
             try:
                 name = socket.gethostbyaddr(ip)[0].split(".")[0]
             except Exception:
                 name = None
             with LOCK:
-                DEV_NAMES[ip] = name or ""
+                if not DEV_NAMES.get(ip):
+                    DEV_NAMES[ip] = name or ""
         time.sleep(5)
 
 
@@ -921,7 +997,13 @@ def threat_match(ip):
 # History (SQLite: sessions + seen baselines + alerts)
 # ----------------------------------------------------------------------------
 
-def db_connect():
+_schema_ready = False
+
+
+def db_init():
+    """Create the schema once. Called at startup; also guarded so the first
+    db_connect() is safe even if something connects before startup runs."""
+    global _schema_ready
     con = sqlite3.connect(DB_FILE, timeout=10)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("""CREATE TABLE IF NOT EXISTS sessions(
@@ -941,6 +1023,17 @@ def db_connect():
     con.execute("""CREATE TABLE IF NOT EXISTS bypass_seen(
         dev TEXT, server TEXT, alerts INTEGER, PRIMARY KEY(dev, server))""")
     con.commit()
+    con.close()
+    _schema_ready = True
+
+
+def db_connect():
+    """Lightweight per-request connection. Schema DDL runs once (db_init), not on
+    every call, so read endpoints (/digest, /dns, /history) stay cheap."""
+    if not _schema_ready:
+        db_init()
+    con = sqlite3.connect(DB_FILE, timeout=10)
+    con.execute("PRAGMA busy_timeout=10000")
     return con
 
 
@@ -1063,7 +1156,9 @@ def db_worker():
                 cutoff = now - RETAIN_DAYS * 86400
                 con.execute("DELETE FROM sessions WHERE last < ?", (cutoff,))
                 con.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
-                con.execute("DELETE FROM dns_targets WHERE last < ?", (cutoff,))
+                # NOTE: dns_targets is deliberately NOT pruned — it's the cumulative
+                # firewall/ACL blocklist and must be a permanent record, not a
+                # rolling 30-day window (it's tiny: one row per distinct resolver).
                 last_prune = now
             con.commit()
         except Exception as e:
@@ -2433,6 +2528,7 @@ def main():
     if IGNORE:
         print("  ignoring devices: %s" % ", ".join(sorted(IGNORE)))
     _load_cache()
+    db_init()          # create the schema once up front, not per request
 
     if args.demo:
         print("  DEMO mode - synthesizing traffic, no capture")

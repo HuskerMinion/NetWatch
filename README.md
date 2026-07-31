@@ -233,6 +233,18 @@ The dashboard is an **unauthenticated LAN service** — anyone who can reach
   public DNS name, add it to `allow_hosts` in `netwatch.conf`; `host_check` can be
   turned off there if needed (not recommended).
 
+## Tests
+
+```bash
+python3 -m pytest tests/        # or, with no pytest installed:
+python3 tests/test_netwatch.py
+```
+
+Unit tests for the pure parsers/classifier and the DB layer — device-name
+overrides, inbound-record retention, the DNS blocklist (dedup + firewall/Pi-hole
+grouping), digest aggregation, and the bypass-alert cap. No root, network, or
+capture needed; the DB tests run against a throwaway sqlite file.
+
 ## License
 
 [MIT](LICENSE) © 2026 huskerminion
