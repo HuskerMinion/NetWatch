@@ -45,8 +45,9 @@ totals and badges for threats or Pi-hole bypass; the alerts feed is severity-cod
   that never does a DNS lookup (hardcoded IPs, IoT phone-homes)
 - **Alerts** on a device reaching a new country, hitting a known-bad IP, or
   bypassing your Pi-hole — in-app plus optional phone push (ntfy), webhook, or email.
-  DNS-bypass alerts are capped at **2 per device** so one chatty device can't flood
-  the feed (every attempt is still logged — see the digest below)
+  Each device's DNS-bypass to a given resolver alerts **twice, then goes quiet for
+  good** (survives clearing alerts and restarts); a *new* resolver alerts again.
+  Every attempt is still logged and rolled up in the digest's DNS-server list
 - **Threat-intelligence flagging** against Tor exit nodes, FireHOL level-1, and
   Spamhaus DROP (auto-refreshed); flagged destinations turn red
 - **Digest** (on-screen panel + optional weekly email) with top talkers, countries,
@@ -173,9 +174,12 @@ The config stays on your Pi and is read locally.
 Alert severities: **critical** (threat-list hit), **warning** (Pi-hole bypass),
 **notice** (new country), **info** (new destination, if enabled).
 
-To keep the feed readable, **DNS-bypass alerts are limited to 2 per device** per
-alerts window (they reset when you clear alerts). This only limits the *alerts* —
-every bypass attempt is still recorded and rolled up in the digest.
+To keep the feed readable, a device's **DNS-bypass to any given resolver alerts
+twice, then stops permanently** — the count is remembered across clearing alerts
+and across restarts, so you won't keep seeing the same device→resolver pair. A
+device reaching a *brand-new* resolver alerts again (twice). This only limits the
+*alerts*; every bypass attempt is still recorded, and every resolver ends up in
+the digest's DNS-server list below (your ready-made blocklist).
 
 ### 7. The digest & the DNS-server blocklist
 

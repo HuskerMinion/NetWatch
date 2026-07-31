@@ -348,11 +348,13 @@ def _mark_bypass(dev, kind, detail):
     now = time.time()
     b = BYPASS.get(dev)
     if not b:
-        b = {"types": set(), "last": 0, "detail": ""}
+        b = {"types": set(), "last": 0, "detail": "", "servers": {}}
         BYPASS[dev] = b
     b["types"].add(kind)
     b["last"] = now
     b["detail"] = detail
+    if detail:                       # remember the most recent resolver per type
+        b.setdefault("servers", {})[kind] = detail
     # Record the resolver/server so the digest can list every DNS destination
     # devices tried to reach (deduped there), for firewall/ACL blocklisting.
     # This is logged for EVERY event, independent of the capped bypass alerts.
@@ -922,6 +924,8 @@ def db_connect():
         server TEXT PRIMARY KEY, kind TEXT, first REAL, last REAL,
         hits INTEGER)""")
     con.execute("CREATE INDEX IF NOT EXISTS ix_dns_last ON dns_targets(last)")
+    con.execute("""CREATE TABLE IF NOT EXISTS bypass_seen(
+        dev TEXT, server TEXT, alerts INTEGER, PRIMARY KEY(dev, server))""")
     con.commit()
     return con
 
@@ -940,8 +944,12 @@ def db_load_baselines(con):
                            "dev": row[3], "dev_name": row[4], "rem": row[5],
                            "host": row[6], "msg": row[7]})
         ALERTS.reverse()
-    print("  history: %d known (device,country) pairs, %d alerts"
-          % (len(SEEN["dev_country"]), len(ALERTS)))
+        for dev, server, alerts in con.execute(
+                "SELECT dev,server,alerts FROM bypass_seen"):
+            _bypass_alert_count[(dev, server)] = alerts
+    print("  history: %d known (device,country) pairs, %d alerts, "
+          "%d bypass pairs seen"
+          % (len(SEEN["dev_country"]), len(ALERTS), len(_bypass_alert_count)))
 
 
 def db_worker():
@@ -968,6 +976,8 @@ def db_worker():
             _alert_persist_q.clear()
             dns_pending = list(_dns_target_q)
             _dns_target_q.clear()
+            bypass_pending = list(_bypass_persist_q)
+            _bypass_persist_q.clear()
         rows = []
         for dev, name, rem, host, g, first, last, up, down in raw:
             gg = g if g.get("status") == "ok" else {}
@@ -995,6 +1005,13 @@ def db_worker():
                     "INSERT INTO dns_targets(server,kind,first,last,hits)"
                     " VALUES(?,?,?,?,1) ON CONFLICT(server) DO UPDATE SET"
                     " last=excluded.last, hits=hits+1", (server, kind, ts, ts))
+            for dev, server in bypass_pending:
+                # persist the per-(device,resolver) bypass alert count so the
+                # 2-alert cap survives restarts (and clears)
+                con.execute(
+                    "INSERT INTO bypass_seen(dev,server,alerts) VALUES(?,?,1)"
+                    " ON CONFLICT(dev,server) DO UPDATE SET alerts=alerts+1",
+                    (dev, server))
             if now - last_prune > 3600:
                 cutoff = now - RETAIN_DAYS * 86400
                 con.execute("DELETE FROM sessions WHERE last < ?", (cutoff,))
@@ -1032,8 +1049,12 @@ def db_history(since, dev=None, limit=500):
 
 _alert_persist_q = []     # alerts waiting to be written by db_worker
 _alert_dedup = set()      # (kind, dev, key) already alerted this run
-_bypass_alert_count = {}  # dev -> number of DNS-bypass alerts shown this window
-BYPASS_ALERT_MAX = 2      # cap DNS-bypass alerts per device (logging is unaffected)
+_bypass_alert_count = {}  # (dev, server) -> bypass alerts shown (persistent, capped)
+_bypass_persist_q = []    # (dev, server) increments waiting to be written to DB
+BYPASS_ALERT_MAX = 2      # alerts per (device, resolver). After this the pair goes
+                          # quiet for good (survives clears + restarts); the resolver
+                          # lives on in the digest's DNS-server list. New/unique
+                          # resolvers still alert. Logging is never affected.
 
 
 def _emit_alert(level, kind, dev, rem, host, msg):
@@ -1065,7 +1086,9 @@ def _alert_pass(warmup):
         flows = list(FLOWS.values())
         geo = dict(GEO)
         names = dict(DEV_NAMES)
-        bypass = {d: dict(v, types=set(v["types"])) for d, v in BYPASS.items()}
+        bypass = {d: dict(v, types=set(v["types"]),
+                          servers=dict(v.get("servers", {})))
+                  for d, v in BYPASS.items()}
         inbound = [(v["dev"], v["rem"], sorted(v["ports"])[0] if v["ports"] else 0)
                    for v in INBOUND.values()]
     if True:
@@ -1091,14 +1114,16 @@ def _alert_pass(warmup):
             if cc:
                 _fire("dev_country", dev, cc, host, cc, names, learning,
                       msg="first connection to %s" % (g.get("country") or cc))
-        # bypass alerts
+        # bypass alerts — one (device, resolver) pair at a time so the per-pair
+        # cap in _fire applies to each distinct DNS server independently.
         for dev, b in bypass.items():
-            for t in b["types"]:
-                _fire("bypass_" + t, dev, b.get("detail", ""), "", None, names,
-                      learning,
+            for t, server in b.get("servers", {}).items():
+                if not server:
+                    continue
+                _fire("bypass_" + t, dev, server, "", None, names, learning,
                       msg=("device using its own %s (%s), bypassing your Pi-hole"
                            % ("encrypted DNS/DoH" if t == "doh" else "external DNS",
-                              b.get("detail", ""))))
+                              server)))
 
 
 def _fire(kind, dev, key, host, cc, names, learning, msg):
@@ -1132,17 +1157,22 @@ def _fire(kind, dev, key, host, cc, names, learning, msg):
         level = "warning"
     else:
         return
+    # DNS-bypass: cap per (device, resolver) instead of the generic once-per-window
+    # dedup. Each distinct resolver a device reaches alerts up to BYPASS_ALERT_MAX
+    # times, then goes quiet permanently — the count is persisted, so clearing
+    # alerts or restarting won't resurface it. A brand-new resolver still alerts.
+    # Everything is logged regardless (DB sessions + the digest DNS-server list).
+    if kind.startswith("bypass_"):
+        pair = (dev, key)                      # key is the resolver/server
+        if _bypass_alert_count.get(pair, 0) >= BYPASS_ALERT_MAX:
+            return
+        _bypass_alert_count[pair] = _bypass_alert_count.get(pair, 0) + 1
+        _bypass_persist_q.append(pair)
+        _emit_alert(level, kind, dev, key, host, msg)
+        return
     dd = (kind, dev, key)
     if dd in _alert_dedup:
         return
-    # DNS-bypass alerts are capped per device so one chatty device (hitting many
-    # resolvers) can't flood the feed. Everything is still LOGGED normally (DB
-    # sessions + the DNS-server digest list); only the visible/notified alerts
-    # are limited.
-    if kind.startswith("bypass_"):
-        if _bypass_alert_count.get(dev, 0) >= BYPASS_ALERT_MAX:
-            return
-        _bypass_alert_count[dev] = _bypass_alert_count.get(dev, 0) + 1
     _alert_dedup.add(dd)
     _emit_alert(level, kind, dev, rem_field, host, msg)
 
@@ -1622,7 +1652,9 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 ALERTS.clear()
                 _alert_dedup.clear()   # let repeats re-alert after a manual clear
-                _bypass_alert_count.clear()   # reset per-device bypass alert cap
+                # NOTE: _bypass_alert_count is deliberately NOT reset — a device's
+                # bypass to a given resolver alerts only twice ever, then stays
+                # quiet across clears/restarts (the resolver is in the digest list).
             try:
                 con = db_connect(); con.execute("DELETE FROM alerts")
                 con.commit(); con.close()
@@ -1849,8 +1881,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="digest">
   <div class="hd"><span>Summary</span><button id="digestClose">&times;</button></div>
   <div class="dseg">
-    <button data-days="1">24 h</button>
-    <button data-days="7" class="on">7 days</button>
+    <button data-days="1" class="on">24 h</button>
+    <button data-days="7">7 days</button>
     <button data-days="30">30 days</button>
   </div>
   <div id="digestBody"><div class="empty">Loading&hellip;</div></div>
@@ -2173,7 +2205,7 @@ document.getElementById("alertClear").addEventListener("click",async()=>{
 
 // ---- Digest panel ----
 const digestPanel=document.getElementById("digest");
-let digestDays=7;
+let digestDays=1;
 async function loadDigest(){
   const body=document.getElementById("digestBody");
   body.innerHTML='<div class="empty">Loading&hellip;</div>';
