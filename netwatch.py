@@ -37,6 +37,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import smtplib
 import socket
 import sqlite3
@@ -952,10 +953,43 @@ def db_load_baselines(con):
           % (len(SEEN["dev_country"]), len(ALERTS), len(_bypass_alert_count)))
 
 
+def _backfill_dns_targets(con):
+    """Seed the DNS-server list from historical bypass alerts so upgrading from a
+    version without the dns_targets table doesn't leave the list empty. The old
+    alerts kept the resolver in the message text; newer ones store it in `rem`.
+    Idempotent (server is a PRIMARY KEY)."""
+    try:
+        rows = con.execute("SELECT ts, kind, rem, msg FROM alerts "
+                           "WHERE kind LIKE 'bypass%'").fetchall()
+    except Exception:
+        return
+    n = 0
+    for ts, kind, rem, msg in rows:
+        server = (rem or "").strip()
+        if not server:                      # old format: pull "(1.2.3.4)" from msg
+            m = re.search(r"\(([^)]+)\)", msg or "")
+            server = m.group(1).strip() if m else ""
+        if not server:
+            continue
+        k = "doh" if "doh" in (kind or "") else "plaintext-dns"
+        try:
+            con.execute(
+                "INSERT INTO dns_targets(server,kind,first,last,hits) "
+                "VALUES(?,?,?,?,1) ON CONFLICT(server) DO UPDATE SET "
+                "last=MAX(last, excluded.last)", (server, k, ts, ts))
+            n += 1
+        except Exception:
+            pass
+    if n:
+        con.commit()
+        print("  backfilled DNS-server list from %d historical bypass alerts" % n)
+
+
 def db_worker():
     try:
         con = db_connect()
         db_load_baselines(con)
+        _backfill_dns_targets(con)
     except Exception as e:
         print("  history disabled (%s)" % e)
         return
@@ -1275,56 +1309,54 @@ def digest_data(days):
     """Structured summary of the last `days` days, shared by the on-screen
     digest panel and the weekly email."""
     since = time.time() - days * 86400
+    total = devices = dests = countries = 0
+    top_dev, top_dst, threats, dns_rows = [], [], [], []
+    by_kind = {}
     try:
         con = db_connect()
-        sess = con.execute("SELECT dev,dev_name,rem,host,cc,country,up,down,threat "
-                           "FROM sessions WHERE last>=?", (since,)).fetchall()
-        alerts = con.execute("SELECT kind FROM alerts WHERE ts>=?",
-                             (since,)).fetchall()
-        dns_rows = con.execute(
-            "SELECT server,kind,hits FROM dns_targets WHERE last>=? "
-            "ORDER BY hits DESC, server", (since,)).fetchall()
+        # Aggregate in SQL (uses the ix_sess_last index) instead of pulling every
+        # session row into Python — this is what keeps the digest fast over 30 days.
+        row = con.execute(
+            "SELECT COALESCE(SUM(up+down),0), COUNT(DISTINCT dev), "
+            "COUNT(DISTINCT rem), COUNT(DISTINCT NULLIF(cc,'')) "
+            "FROM sessions WHERE last>=?", (since,)).fetchone()
+        total, devices, dests, countries = row
+        top_dev = [{"name": nm or dev, "up": up or 0, "down": down or 0,
+                    "total": (up or 0) + (down or 0)}
+                   for dev, nm, up, down in con.execute(
+                       "SELECT dev, MAX(dev_name), SUM(up), SUM(down) FROM sessions "
+                       "WHERE last>=? GROUP BY dev ORDER BY SUM(up+down) DESC "
+                       "LIMIT 10", (since,))]
+        top_dst = [{"host": host or rem, "cc": cc or "", "up": up or 0,
+                    "down": down or 0, "total": (up or 0) + (down or 0)}
+                   for rem, host, cc, up, down in con.execute(
+                       "SELECT rem, MAX(host), MAX(cc), SUM(up), SUM(down) "
+                       "FROM sessions WHERE last>=? GROUP BY rem "
+                       "ORDER BY SUM(up+down) DESC LIMIT 10", (since,))]
+        by_kind = {k: c for (k, c) in con.execute(
+            "SELECT kind, COUNT(*) FROM alerts WHERE ts>=? GROUP BY kind",
+            (since,))}
+        threats = [{"dev": nm or dev, "rem": host or rem, "country": country or cc}
+                   for dev, nm, rem, host, country, cc in con.execute(
+                       "SELECT dev, MAX(dev_name), rem, MAX(host), MAX(country), "
+                       "MAX(cc) FROM sessions WHERE threat<>'' AND last>=? "
+                       "GROUP BY dev, rem ORDER BY MAX(last) DESC LIMIT 50",
+                       (since,))]
+        # DNS-server blocklist: the FULL cumulative list of every resolver devices
+        # have tried to reach (NOT windowed) — the same running list on every digest
+        # view (24h/7d/30d). Tiny table, so this stays instant.
+        dns_rows = con.execute("SELECT server, kind, hits FROM dns_targets "
+                               "ORDER BY hits DESC, server").fetchall()
         con.close()
     except Exception:
-        sess, alerts, dns_rows = [], [], []
-    dev_b, dest_b, countries, threats = {}, {}, set(), []
-    total = 0
-    for dev, dname, rem, host, cc, country, up, down, threat in sess:
-        up, down = up or 0, down or 0
-        total += up + down
-        d = dev_b.setdefault(dev, {"name": dname or dev, "up": 0, "down": 0})
-        if dname:
-            d["name"] = dname
-        d["up"] += up; d["down"] += down
-        t = dest_b.setdefault(rem, {"host": host or rem, "cc": cc or "",
-                                    "up": 0, "down": 0})
-        if host and t["host"] == rem:
-            t["host"] = host
-        t["up"] += up; t["down"] += down
-        if cc:
-            countries.add(cc)
-        if threat:
-            threats.append({"dev": dname or dev, "rem": host or rem,
-                            "country": country or cc})
-    by_kind = {}
-    for (kind,) in alerts:
-        by_kind[kind] = by_kind.get(kind, 0) + 1
-    top_dev = sorted(({"name": v["name"], "up": v["up"], "down": v["down"],
-                       "total": v["up"] + v["down"]} for v in dev_b.values()),
-                     key=lambda x: -x["total"])[:10]
-    top_dst = sorted(({"host": v["host"], "cc": v["cc"], "up": v["up"],
-                       "down": v["down"], "total": v["up"] + v["down"]}
-                      for v in dest_b.values()), key=lambda x: -x["total"])[:10]
-    # Deduplicated list of DNS servers/resolvers devices tried to reach (for
-    # blocklisting at a firewall/ACL). SQLite PRIMARY KEY already dedups by
-    # server; label the kind in plain English.
+        pass
     dns_targets = [{"server": s,
                     "kind": "encrypted DNS/DoH" if k == "doh" else "external DNS",
                     "hits": h} for (s, k, h) in dns_rows]
-    return {"days": days, "total": total, "devices": len(dev_b),
-            "dests": len(dest_b), "countries": len(countries),
+    return {"days": days, "total": total, "devices": devices,
+            "dests": dests, "countries": countries,
             "top_devices": top_dev, "top_dests": top_dst,
-            "alerts_total": len(alerts), "alerts_by_kind": by_kind,
+            "alerts_total": sum(by_kind.values()), "alerts_by_kind": by_kind,
             "threats": threats, "dns_targets": dns_targets}
 
 
@@ -2243,7 +2275,7 @@ async function loadDigest(){
   }
   if(d.dns_targets&&d.dns_targets.length){
     h+='<div class="section-hd"><span>DNS servers to block ('+d.dns_targets.length+")</span></div>";
-    h+='<div class="dg-note">Resolvers devices tried to reach &mdash; block these at your firewall/ACL.</div>';
+    h+='<div class="dg-note">Every resolver seen (last 30 days, all windows) &mdash; block these at your firewall/ACL.</div>';
     h+=d.dns_targets.map(t=>'<div class="row"><div class="top">'
       +'<div class="nm">'+esc(t.server)+'</div><div class="cnt">'+t.hits+"</div></div>"
       +'<div class="ipline">'+esc(t.kind)+"</div></div>").join("");

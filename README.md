@@ -28,13 +28,17 @@ Pure Python 3 standard library — **nothing to install**.
 
 ## Screenshots
 
+![NetWatch live map](docs/netwatch-map.png)
+
+*A live world map with animated arcs from your network to every remote endpoint,
+colored by device — flagged/threat destinations glow red.*
+
 | Devices & destinations | Alerts feed |
 |---|---|
 | ![devices](docs/netwatch-devices.png) | ![alerts](docs/netwatch-alerts.png) |
 
-*The main view's left panel is a live world map (add a screenshot from your own
-deployment for the best hero image). Devices are color-coded with upload/download
-totals and badges for threats or Pi-hole bypass; the alerts feed is severity-coded.*
+*Devices are color-coded with upload/download totals and badges for threats or
+Pi-hole bypass; the alerts feed is severity-coded.*
 
 ---
 
