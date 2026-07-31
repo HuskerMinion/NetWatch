@@ -57,6 +57,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
+VERSION = "2026.07.31"   # shown in the header + startup log so you can confirm
+                         # which build is actually running after a deploy
 DEFAULT_PORT = 8339
 GEO_BATCH_URL = ("http://ip-api.com/batch?fields=status,message,country,"
                  "countryCode,regionName,city,lat,lon,isp,org,query")
@@ -1342,22 +1344,30 @@ def digest_data(days):
                        "MAX(cc) FROM sessions WHERE threat<>'' AND last>=? "
                        "GROUP BY dev, rem ORDER BY MAX(last) DESC LIMIT 50",
                        (since,))]
-        # DNS-server blocklist: the FULL cumulative list of every resolver devices
-        # have tried to reach (NOT windowed) — the same running list on every digest
-        # view (24h/7d/30d). Tiny table, so this stays instant.
-        dns_rows = con.execute("SELECT server, kind, hits FROM dns_targets "
-                               "ORDER BY hits DESC, server").fetchall()
         con.close()
     except Exception:
         pass
-    dns_targets = [{"server": s,
-                    "kind": "encrypted DNS/DoH" if k == "doh" else "external DNS",
-                    "hits": h} for (s, k, h) in dns_rows]
     return {"days": days, "total": total, "devices": devices,
             "dests": dests, "countries": countries,
             "top_devices": top_dev, "top_dests": top_dst,
             "alerts_total": sum(by_kind.values()), "alerts_by_kind": by_kind,
-            "threats": threats, "dns_targets": dns_targets}
+            "threats": threats, "dns_targets": dns_blocklist()}
+
+
+def dns_blocklist():
+    """The full cumulative list of every DNS resolver devices have tried to reach
+    (NOT time-windowed) — a ready-to-paste firewall/ACL blocklist. Its own tiny,
+    instant query so the DNS view never waits on the traffic aggregation."""
+    try:
+        con = db_connect()
+        rows = con.execute("SELECT server, kind, hits FROM dns_targets "
+                           "ORDER BY hits DESC, server").fetchall()
+        con.close()
+    except Exception:
+        rows = []
+    return [{"server": s,
+             "kind": "encrypted DNS/DoH" if k == "doh" else "external DNS",
+             "hits": h} for (s, k, h) in rows]
 
 
 def build_digest():
@@ -1530,7 +1540,7 @@ def snapshot():
          for d in dest_list), key=lambda d: -d["total"])[:12]
 
     return {
-        "home": HOME, "geo_state": GEO_STATE,
+        "version": VERSION, "home": HOME, "geo_state": GEO_STATE,
         "capture": {"iface": CAP_STATE["iface"], "pps": CAP_STATE["pps"],
                     "drops": CAP_STATE["drops"], "error": CAP_STATE["error"],
                     "demo": CAP_STATE["demo"]},
@@ -1659,6 +1669,9 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             days = max(1, min(90, int(float(q.get("days", ["7"])[0]))))
             body = json.dumps(digest_data(days)).encode("utf-8")
+            ctype = "application/json"
+        elif u.path == "/dns":                 # instant cumulative DNS blocklist
+            body = json.dumps({"dns_targets": dns_blocklist()}).encode("utf-8")
             ctype = "application/json"
         else:
             self.send_response(404); self.end_headers(); return
@@ -1819,6 +1832,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .inb .meta{color:var(--text-secondary);font-size:12px;margin-top:1px}
   .inb .ipline{color:var(--text-muted);font-size:11px;font-family:Consolas,ui-monospace,monospace;margin-top:1px}
   .dg-note{color:var(--text-muted);font-size:11px;padding:2px 14px 6px}
+  #ver{color:var(--text-muted);font-size:11px;align-self:center;margin:-6px 4px 0 -4px;font-family:Consolas,ui-monospace,monospace}
+  .dg-copy{margin:6px 12px;padding:6px 12px;background:var(--surface-3);border:1px solid var(--border);
+    color:var(--text-secondary);border-radius:7px;font:inherit;font-size:12px;cursor:pointer}
+  .dg-copy:hover{border-color:var(--series-1);color:var(--text-primary)}
   #alertClear{font-size:11px !important;border:1px solid var(--border) !important;border-radius:6px;
     padding:3px 9px !important;margin-right:8px;color:var(--text-secondary) !important}
   #alertClear:hover{border-color:var(--bad) !important;color:var(--text-primary) !important}
@@ -1876,6 +1893,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="app">
   <header>
     <h1>Net<span>Watch</span></h1>
+    <span id="ver" title="running build">v–</span>
     <span class="pill" id="capPill"><span class="led"></span><span id="capTxt">capture</span></span>
     <span class="pill" id="geoPill"><span class="led"></span><span id="geoTxt">geo: waiting</span></span>
     <span class="pill" id="threatPill" style="display:none"><span class="led"></span><span id="threatTxt">threat</span></span>
@@ -1916,6 +1934,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button data-days="1" class="on">24 h</button>
     <button data-days="7">7 days</button>
     <button data-days="30">30 days</button>
+    <button data-view="dns">DNS list</button>
   </div>
   <div id="digestBody"><div class="empty">Loading&hellip;</div></div>
 </div>
@@ -1986,6 +2005,7 @@ function destTip(d){const g=d.geo||{};
 
 function render(d){
   latest=d;
+  if(d.version)document.getElementById("ver").textContent="v"+d.version;
   document.getElementById("tActive").textContent=d.stats.active;
   document.getElementById("tDevices").textContent=d.stats.devices;
   document.getElementById("tDests").textContent=d.stats.dests;
@@ -2273,14 +2293,41 @@ async function loadDigest(){
     h+=d.threats.slice(0,20).map(t=>'<div class="row flag"><div class="nm">'+esc(t.dev)
       +" &rarr; "+esc(t.rem)+'</div><div class="ipline">'+esc(t.country||"")+"</div></div>").join("");
   }
-  if(d.dns_targets&&d.dns_targets.length){
-    h+='<div class="section-hd"><span>DNS servers to block ('+d.dns_targets.length+")</span></div>";
-    h+='<div class="dg-note">Every resolver seen (last 30 days, all windows) &mdash; block these at your firewall/ACL.</div>';
-    h+=d.dns_targets.map(t=>'<div class="row"><div class="top">'
-      +'<div class="nm">'+esc(t.server)+'</div><div class="cnt">'+t.hits+"</div></div>"
-      +'<div class="ipline">'+esc(t.kind)+"</div></div>").join("");
-  }
   document.getElementById("digestBody").innerHTML=h;
+}
+async function loadDNS(){
+  const body=document.getElementById("digestBody");
+  body.innerHTML='<div class="empty">Loading&hellip;</div>';
+  let d;
+  try{ d=await (await fetch("/dns",{cache:"no-store"})).json(); }
+  catch(e){ body.innerHTML='<div class="empty">Could not load DNS list.</div>'; return; }
+  const list=d.dns_targets||[];
+  let h='<div class="dg-hero"><b>'+list.length+'</b><small>DNS servers seen &middot; cumulative blocklist</small></div>';
+  if(!list.length){
+    body.innerHTML=h+'<div class="empty">No DNS-bypass activity recorded yet. As devices try their own resolvers, they show up here.</div>';
+    return;
+  }
+  h+='<div class="dg-note">Every resolver your devices tried to reach. Paste these into a firewall rule or ACL/IP group to block them.</div>';
+  h+='<button class="dg-copy" id="dnsCopy">Copy all</button>';
+  h+=list.map(t=>'<div class="row"><div class="top">'
+    +'<div class="nm">'+esc(t.server)+'</div><div class="cnt">'+t.hits+"</div></div>"
+    +'<div class="ipline">'+esc(t.kind)+"</div></div>").join("");
+  body.innerHTML=h;
+  const text=list.map(t=>t.server).join("\n");
+  const btn=document.getElementById("dnsCopy");
+  btn.addEventListener("click",()=>{
+    const done=()=>{btn.textContent="Copied!";setTimeout(()=>{btn.textContent="Copy all";},1500);};
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done).catch(()=>fallbackCopy(text,done,btn));
+    } else fallbackCopy(text,done,btn);
+  });
+}
+function fallbackCopy(text,done,btn){
+  const ta=document.createElement("textarea");ta.value=text;ta.style.position="fixed";ta.style.opacity="0";
+  document.body.appendChild(ta);ta.select();
+  try{ document.execCommand("copy"); done(); }
+  catch(e){ btn.textContent="Select the list & copy"; }
+  document.body.removeChild(ta);
 }
 document.getElementById("digestBtn").addEventListener("click",()=>{
   const opening=!digestPanel.classList.contains("open");
@@ -2289,9 +2336,9 @@ document.getElementById("digestBtn").addEventListener("click",()=>{
 });
 document.getElementById("digestClose").addEventListener("click",()=>digestPanel.classList.remove("open"));
 document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",()=>{
-  digestDays=+b.dataset.days;
   document.querySelectorAll(".dseg button").forEach(x=>x.classList.toggle("on",x===b));
-  loadDigest();
+  if(b.dataset.view==="dns"){ loadDNS(); }
+  else { digestDays=+b.dataset.days; loadDigest(); }
 }));
 
 let quitting=false;
@@ -2336,7 +2383,7 @@ def main():
         except ValueError:
             sys.exit("--home must look like 39.74,-104.99")
 
-    print("NetWatch starting...")
+    print("NetWatch v%s starting..." % VERSION)
     load_config()
     if args.pihole:
         PIHOLE_IPS.update(args.pihole)
