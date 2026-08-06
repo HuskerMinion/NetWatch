@@ -53,7 +53,17 @@ Pi-hole bypass; the alerts feed is severity-coded.*
   good** (survives clearing alerts and restarts); a *new* resolver alerts again.
   Every attempt is still logged and rolled up in the digest's DNS-server list
 - **Threat-intelligence flagging** against Tor exit nodes, FireHOL level-1, and
-  Spamhaus DROP (auto-refreshed); flagged destinations turn red
+  Spamhaus DROP (auto-refreshed); flagged destinations turn red, and the dashboard
+  names *which* list matched rather than just showing a red dot
+- **Flagged & inbound are events, not live flows** — a blocklist hit or an
+  unsolicited inbound connection stays on the header counter and in the side panel
+  for a retention window (6h by default, `event_retain_hours`), and is saved to the
+  database so a restart doesn't blank the counters. Both tiles share one window, so
+  flagged never drains faster than inbound
+- **Click anything for details** — a flagged row, an alert, a destination, a digest
+  threat hit, or a top talker opens a drawer explaining what the address is: geo and
+  ISP, which blocklist flagged it and what that list means, every device that talked
+  to it, ports, hostnames, volume, 30 days of history, and every related alert
 - **Digest** (on-screen panel + optional weekly email) with top talkers, countries,
   alert counts, threat hits, and a **deduplicated list of every DNS server/resolver
   devices tried to reach** — a ready-made blocklist for your firewall or ACLs
@@ -66,7 +76,8 @@ Pi-hole bypass; the alerts feed is severity-coded.*
   manual name map (any switch/controller that can export a client list works)
 - **Unsolicited-inbound detection** — flags TCP connections opened *to* your devices
   from the internet
-- Per-device map filtering, a searchable side panel, and a dark themed UI
+- Per-device map filtering, a searchable side panel, and a dark themed UI that also
+  works on a phone
 
 ## How it works (and its limits)
 
@@ -177,8 +188,16 @@ In-app alerts always work. For phone/email/webhook notifications and tuning, cop
 script and edit it (Pi-hole IPs, warm-up window, ntfy/webhook/email channels).
 The config stays on your Pi and is read locally.
 
-Alert severities: **critical** (threat-list hit), **warning** (Pi-hole bypass),
-**notice** (new country), **info** (new destination, if enabled).
+Alert severities: **critical** (threat-list hit), **warning** (Pi-hole bypass and
+unsolicited inbound), **notice** (new country, new device), **info** (new
+destination, if enabled).
+
+The header's **flagged** and **inbound** tiles are *event* counters, not live-flow
+counters. A blocklist hit or an inbound connection attempt stays counted for
+`event_retain_hours` (default 6) after its last sighting and is persisted to the
+database, so it behaves like its alert instead of disappearing when the underlying
+flow ages out of the 2-minute flow table — and both tiles use the same window, so
+flagged can never expire before inbound. Click either tile to jump to its list.
 
 To keep the feed readable, a device's **DNS-bypass to any given resolver alerts
 twice, then stops permanently** — the count is remembered across clearing alerts
@@ -196,7 +215,27 @@ while bypassing your sanctioned DNS. That list is exactly what you'd paste into 
 firewall rule or ACL/IP group to block them. Enable `weekly_digest` (with email
 configured) in `netwatch.conf` to also receive this as a weekly email.
 
-### 8. Naming your devices (optional)
+### 8. Investigating something suspicious
+
+Anything that names a remote address is clickable, and opens a **detail drawer** for
+it: a flagged row or inbound row in the side panel, the ⓘ on a destination, a row in
+the alerts feed, a threat hit or top destination in the digest. The drawer answers
+"what actually is this?" in one place:
+
+- **the verdict** — whether it's on a blocklist, *which* one(s), and what a hit on
+  that particular list means (a Tor exit node is a very different story from a
+  Spamhaus DROP netblock)
+- **identity** — hostnames seen via TLS SNI and DNS, reverse DNS, city/country, ISP
+  and organisation
+- **who touched it** — every device, with ports, protocol, and volume; live flows
+  now, retained flagged contacts, unsolicited inbound attempts, and per-device
+  history over the 30-day retention
+- **every alert** NetWatch has raised that named the address
+
+From there you can filter the whole dashboard to that address, jump to it on the
+map, or copy it for a firewall rule.
+
+### 9. Naming your devices (optional)
 
 By default NetWatch names each device by reverse-DNS (the hostname it registered
 via DHCP), falling back to its MAC vendor, then its IP. To show your own friendly
@@ -244,6 +283,12 @@ Unit tests for the pure parsers/classifier and the DB layer — device-name
 overrides, inbound-record retention, the DNS blocklist (dedup + firewall/Pi-hole
 grouping), digest aggregation, and the bypass-alert cap. No root, network, or
 capture needed; the DB tests run against a throwaway sqlite file.
+
+`tests/test_netwatch_events.py` covers the event model specifically: that a flagged
+hit outlives its flow being dropped, that flagged and inbound expire on the same
+boundary, blocklist attribution (including the multi-list case), the threat-verdict
+cache invalidating when the lists reload, event round-trips through SQLite, and the
+`/detail` aggregation.
 
 ## License
 

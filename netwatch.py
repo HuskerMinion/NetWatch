@@ -57,7 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.07.31.5"  # date + same-day build number, so successive changes on
+VERSION = "2026.08.06.1"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -78,11 +78,17 @@ NAMES_FILE = os.path.join(HERE, "netwatch_names.json")  # manual MAC/IP -> name 
 
 STALE_AFTER = 10       # seconds since last packet -> flow shown as fading
 DROP_AFTER = 120       # seconds since last packet -> flow removed
-INBOUND_RETAIN = 6 * 3600  # keep inbound-connection records visible this long (6h).
-                           # An inbound hit is a security EVENT, not a live flow: it
-                           # should linger on the counter/panel like its alert does,
-                           # not vanish in 2 minutes.
+EVENT_RETAIN = 6 * 3600    # how long a security EVENT stays visible on the counters
+                           # and side panel (6h). Applies equally to unsolicited
+                           # inbound connections AND threat-list hits: both are
+                           # events, not live flows, so they must linger like their
+                           # alert does instead of vanishing with the flow in 2
+                           # minutes. Override with "event_retain_hours" in
+                           # netwatch.conf. Both kinds are persisted to SQLite and
+                           # reloaded on start, so a restart doesn't blank them.
+INBOUND_RETAIN = EVENT_RETAIN   # back-compat alias (same window, one knob)
 INBOUND_MAX = 400      # cap on retained inbound records (drop oldest beyond this)
+THREAT_HIT_MAX = 600   # cap on retained threat-hit records (drop oldest beyond this)
 GEO_RETRY = 60
 CACHE_SAVE_EVERY = 30
 CAP_BYTES = 512        # bytes captured per frame (enough for headers + most SNI)
@@ -108,6 +114,23 @@ THREAT_SOURCES = {
                "master/firehol_level1.netset",
     "spamhaus": "https://www.spamhaus.org/drop/drop.txt",
 }
+# Human-readable name per source, plus what a hit on it actually means. Shown in
+# the detail drawer so "flagged" is an explanation rather than a red dot.
+THREAT_LABELS = {
+    "tor": "Tor exit node",
+    "firehol": "FireHOL level 1",
+    "spamhaus": "Spamhaus DROP",
+    "blocklist": "Public blocklist",
+}
+THREAT_MEANING = {
+    "tor": "The far end is a Tor exit relay. Traffic to it is anonymised — normal "
+           "for a Tor user on your LAN, suspicious for an IoT device or a TV.",
+    "firehol": "Aggregated list of IPs that should never appear in normal traffic: "
+               "bogons, hijacked ranges, and known attack infrastructure.",
+    "spamhaus": "Spamhaus DROP — netblocks leased or hijacked wholesale by "
+                "criminal operations. No legitimate traffic should go here.",
+    "blocklist": "Matched a public reputation blocklist.",
+}
 
 LOCK = threading.RLock()   # reentrant: a thread may re-acquire without deadlocking
 FLOWS = {}      # (dev,rem) -> {dev,rem,proto,ports:set,first,last,pkts,up,down,host}
@@ -115,14 +138,23 @@ GEO = {}        # ip -> {status, ts, ...}
 DEV_NAMES = {}  # lan_ip -> hostname
 NAMES_OVERRIDE = {}  # normalized MAC or IP -> user-supplied friendly name (top priority)
 IPDOMAIN = {}   # public_ip -> domain (learned from sniffed DNS answers)
-BYPASS = {}     # dev_ip -> {"type": set(), "last": ts, "detail": str}
+BYPASS = {}     # dev_ip -> {"types": set(), "last": ts, "detail": str, "servers": {}}
 SEEN = {"dev_country": set(), "dev_rem": set(), "device": set()}  # baselines loaded from DB
 ALERTS = []     # recent alert dicts (also persisted)
-THREAT = {"exact": set(), "nets": [], "loaded": 0, "ts": 0, "error": None}
+# exact: ip -> comma-joined source keys ("tor", "firehol,spamhaus", ...)
+# nets:  list of (ip_network, source_key)
+# gen:   bumped every time the lists are replaced, so the threat_match memo cache
+#        can be invalidated instead of serving verdicts from an empty list.
+THREAT = {"exact": {}, "nets": [], "loaded": 0, "ts": 0, "error": None, "gen": 0}
 DEV_MAC = {}    # lan_ip -> MAC string (from sniffed Ethernet headers)
 OUI = {}        # 6-hex OUI prefix -> vendor name
 OUI_STATE = {"loaded": 0}
 INBOUND = {}    # (dev, rem) -> {dev, rem, ports:set, first, last, count}
+# Threat-list hits kept as EVENTS for EVENT_RETAIN, independent of the live flow
+# table. This is what the header's "flagged" tile counts, so a hit stays on screen
+# for hours like its alert does instead of disappearing when the flow ages out.
+THREAT_HITS = {}  # (dev, rem, dir) -> {dev, rem, dir, ports:set, hosts:set,
+                  #                     lists:str, first, last, count}
 HOME = None
 GEO_STATE = "waiting"
 CAP_STATE = {"iface": "", "pkts": 0, "pps": 0.0, "drops": 0, "error": None,
@@ -312,9 +344,7 @@ def parse_sni(buf, n, off):
                 start = p + 5
                 if start + nlen > n:
                     return None
-                host = buf[start:start + nlen].decode("idna", "ignore") \
-                    if False else buf[start:start + nlen].decode("ascii", "ignore")
-                return host or None
+                return buf[start:start + nlen].decode("ascii", "ignore") or None
             p += elen
     except Exception:
         return None
@@ -384,6 +414,37 @@ def _record_inbound(dev, rem, dport):
         e["ports"].add(dport)
         e["last"] = now
         e["count"] += 1
+
+
+def _record_threat_hit(dev, rem, direction, lists, ports=(), host=None, ts=None,
+                       count=1, first=None):
+    """Log a contact with a blocklisted IP as a retained EVENT.
+
+    The header's "flagged" tile counts these, NOT the live flow table, which is why
+    a flagged destination now stays on screen for EVENT_RETAIN instead of vanishing
+    when its flow ages out after DROP_AFTER (2 minutes). Call under LOCK."""
+    now = ts if ts is not None else time.time()
+    key = (dev, rem, direction)
+    e = THREAT_HITS.get(key)
+    if e is None:
+        # count starts at 1 for the sighting that created the record; `count` on
+        # later calls is an increment (0 = "still happening", don't double-count
+        # the same ongoing flow on every 4-second evaluation pass).
+        e = {"dev": dev, "rem": rem, "dir": direction, "ports": set(),
+             "hosts": set(), "lists": lists or "", "count": 1,
+             "first": first if first is not None else now, "last": now}
+        THREAT_HITS[key] = e
+    else:
+        e["count"] += count
+    e["ports"].update(p for p in ports if p)
+    if host:
+        e["hosts"].add(host)
+    if lists:
+        e["lists"] = lists
+    e["last"] = max(e["last"], now)
+    if first is not None:
+        e["first"] = min(e["first"], first)
+    return e
 
 
 def mac_vendor(dev):
@@ -573,12 +634,21 @@ def _prune(now):
     with LOCK:
         for k in [k for k, f in FLOWS.items() if now - f["last"] > DROP_AFTER]:
             del FLOWS[k]
-        for k in [k for k, v in INBOUND.items() if now - v["last"] > INBOUND_RETAIN]:
+        # Security events (inbound + threat hits) share one retention window, so the
+        # flagged tile can never drain faster than the inbound tile.
+        for k in [k for k, v in INBOUND.items() if now - v["last"] > EVENT_RETAIN]:
             del INBOUND[k]
         if len(INBOUND) > INBOUND_MAX:      # bound memory: keep the most recent
             for k, _ in sorted(INBOUND.items(), key=lambda kv: kv[1]["last"]
                                )[:len(INBOUND) - INBOUND_MAX]:
                 del INBOUND[k]
+        for k in [k for k, v in THREAT_HITS.items()
+                  if now - v["last"] > EVENT_RETAIN]:
+            del THREAT_HITS[k]
+        if len(THREAT_HITS) > THREAT_HIT_MAX:
+            for k, _ in sorted(THREAT_HITS.items(), key=lambda kv: kv[1]["last"]
+                               )[:len(THREAT_HITS) - THREAT_HIT_MAX]:
+                del THREAT_HITS[k]
 
 
 # ----------------------------------------------------------------------------
@@ -605,12 +675,19 @@ def demo_loop():
     with LOCK:
         DEV_NAMES.update(dnames)
         # Demo a threat hit and a DNS-bypass so those features are visible.
-        THREAT["exact"].add("77.88.8.8"); THREAT["loaded"] = 1
+        # 101.6.6.6 lands on two lists so the detail drawer's multi-list case shows.
+        THREAT["exact"]["77.88.8.8"] = "spamhaus"
+        THREAT["exact"]["101.6.6.6"] = "tor,firehol"
+        THREAT["loaded"] = len(THREAT["exact"])
         THREAT["ts"] = START_TS
+        THREAT["gen"] += 1
         # MAC vendor demo: the un-named device resolves to a vendor name
         DEV_MAC["192.168.1.66"] = "44:07:0b:11:22:33"
         OUI["44070B"] = "Amazon Technologies"; OUI_STATE["loaded"] = 1
-        # An unsolicited inbound connection attempt (e.g. hitting a forwarded port)
+        # An unsolicited inbound connection attempt (e.g. hitting a forwarded port),
+        # from an IP that is itself on a blocklist -> inbound AND flagged.
+        THREAT["exact"]["185.220.101.5"] = "tor"
+        THREAT["loaded"] = len(THREAT["exact"])
         _record_inbound("192.168.1.20", "185.220.101.5", 22)
         _record_inbound("192.168.1.20", "185.220.101.5", 22)
         # DNS-bypass demo: one device reaches SEVERAL resolvers. This shows both
@@ -836,7 +913,7 @@ def geo_worker():
 # ----------------------------------------------------------------------------
 
 def load_config():
-    global CONF, PIHOLE_IPS, IGNORE
+    global CONF, PIHOLE_IPS, IGNORE, EVENT_RETAIN, INBOUND_RETAIN
     cfg = {}
     try:
         with open(CONF_FILE, "r", encoding="utf-8") as f:
@@ -849,14 +926,24 @@ def load_config():
     CONF = cfg
     PIHOLE_IPS = set(cfg.get("pihole_ips", []))
     IGNORE = set(cfg.get("ignore_devices", []))
+    try:
+        hrs = float(cfg.get("event_retain_hours", EVENT_RETAIN / 3600.0))
+        # 5 minutes to 30 days; one window for BOTH inbound and flagged events
+        EVENT_RETAIN = max(300.0, min(30 * 86400.0, hrs * 3600.0))
+        INBOUND_RETAIN = EVENT_RETAIN
+    except (TypeError, ValueError):
+        print("  config: event_retain_hours must be a number; using default")
 
 
 # ----------------------------------------------------------------------------
 # Threat intelligence (public blocklists -> flag remote IPs)
 # ----------------------------------------------------------------------------
 
-def _parse_netset(text):
-    exact, nets = set(), []
+def _parse_netset(text, source="blocklist"):
+    """Parse a plain-text IP/CIDR blocklist. Returns (exact, nets) where exact is
+    {ip: source} and nets is [(network, source)] — the source tag is what lets the
+    UI say "Tor exit node" instead of a bare red dot."""
+    exact, nets = {}, []
     for line in text.splitlines():
         line = line.split("#")[0].split(";")[0].strip()
         if not line:
@@ -864,10 +951,10 @@ def _parse_netset(text):
         token = line.split()[0]
         try:
             if "/" in token:
-                nets.append(ipaddress.ip_network(token, strict=False))
+                nets.append((ipaddress.ip_network(token, strict=False), source))
             else:
                 ipaddress.ip_address(token)
-                exact.add(token)
+                exact[token] = source
         except ValueError:
             continue
     return exact, nets
@@ -879,39 +966,54 @@ def _http_text(url, timeout=25):
         return r.read().decode("utf-8", "ignore")
 
 
+def _threat_install(exact, nets, ts):
+    """Swap in a new blocklist set and bump the generation counter so every
+    memoised verdict from the previous generation is discarded."""
+    with LOCK:
+        THREAT["exact"] = exact
+        THREAT["nets"] = nets
+        THREAT["loaded"] = len(exact) + len(nets)
+        THREAT["ts"] = ts
+        THREAT["gen"] += 1
+
+
 def threat_worker():
     # Try disk cache first for an instant start.
     try:
         with open(THREAT_CACHE, "r", encoding="utf-8") as f:
             c = json.load(f)
-        with LOCK:
-            THREAT["exact"] = set(c.get("exact", []))
-            THREAT["nets"] = [ipaddress.ip_network(x) for x in c.get("nets", [])]
-            THREAT["loaded"] = len(THREAT["exact"]) + len(THREAT["nets"])
-            THREAT["ts"] = c.get("ts", 0)
+        cached_exact = c.get("exact", {})
+        if isinstance(cached_exact, list):     # pre-attribution cache format
+            cached_exact = {ip: "blocklist" for ip in cached_exact}
+        cached_nets = []
+        for item in c.get("nets", []):
+            # new format: ["1.2.3.0/24", "spamhaus"]; old format: "1.2.3.0/24"
+            net, src = item if isinstance(item, (list, tuple)) else (item, "blocklist")
+            cached_nets.append((ipaddress.ip_network(net), src))
+        _threat_install(cached_exact, cached_nets, c.get("ts", 0))
     except Exception:
         pass
     while True:
-        exact, nets, srcs_ok = set(), [], 0
+        exact, nets, srcs_ok = {}, [], 0
         for name, url in THREAT_SOURCES.items():
             try:
-                e, nn = _parse_netset(_http_text(url))
-                exact |= e
+                e, nn = _parse_netset(_http_text(url), name)
+                for ip, src in e.items():
+                    prev = exact.get(ip)
+                    # an IP on several lists keeps all of them, comma-joined
+                    exact[ip] = src if not prev else prev + "," + src
                 nets += nn
                 srcs_ok += 1
             except Exception:
                 pass
         if srcs_ok:
+            _threat_install(exact, nets, time.time())
             with LOCK:
-                THREAT["exact"] = exact
-                THREAT["nets"] = nets
-                THREAT["loaded"] = len(exact) + len(nets)
-                THREAT["ts"] = time.time()
                 THREAT["error"] = None
             try:
                 with open(THREAT_CACHE, "w", encoding="utf-8") as f:
-                    json.dump({"exact": sorted(exact),
-                               "nets": [str(x) for x in nets],
+                    json.dump({"exact": exact,
+                               "nets": [[str(n), s] for n, s in nets],
                                "ts": THREAT["ts"]}, f)
             except Exception:
                 pass
@@ -963,34 +1065,61 @@ def oui_worker():
         time.sleep(OUI_REFRESH)
 
 
-_threat_verdict = {}     # ip -> list-name or "" (memoised)
+_threat_verdict = {}     # ip -> comma-joined source keys, or "" (memoised)
+_threat_verdict_gen = -1  # generation the memo cache above was built against
 
 
 def threat_match(ip):
+    """Comma-joined blocklist source keys for `ip` (e.g. "tor" or
+    "firehol,spamhaus"), or None if it isn't listed. Truthy on a hit, so callers
+    that only test for listedness keep working."""
+    global _threat_verdict_gen
+    with LOCK:
+        gen = THREAT["gen"]
+        exact = THREAT["exact"]
+        nets = THREAT["nets"]
+        loaded = THREAT["loaded"]
+    # The lists load asynchronously at startup. Without this guard the first few
+    # seconds of traffic get memoised as "clean" against an EMPTY blocklist and are
+    # never re-checked — a silent false negative on every single restart. Verdicts
+    # are therefore tied to a generation, and nothing is cached before a list exists.
+    if gen != _threat_verdict_gen:
+        _threat_verdict.clear()
+        _threat_verdict_gen = gen
+    if not loaded:
+        return None
     v = _threat_verdict.get(ip)
     if v is not None:
         return v or None
-    with LOCK:
-        exact = THREAT["exact"]
-        nets = THREAT["nets"]
-    hit = ""
-    if ip in exact:
-        hit = "blocklist"
-    else:
-        try:
-            a = ipaddress.ip_address(ip)
-            for net in nets:
-                if a in net:
-                    hit = "blocklist"
-                    break
-        except ValueError:
-            pass
+    hits = []
+    src = exact.get(ip)
+    if src:
+        hits.append(src)
+    try:
+        a = ipaddress.ip_address(ip)
+        for net, nsrc in nets:
+            if a in net and nsrc not in hits:
+                hits.append(nsrc)
+    except ValueError:
+        pass
+    hit = ",".join(sorted(set(",".join(hits).split(","))) if hits else [])
     # Bound the cache: on an always-on service the set of distinct remote IPs
     # grows forever, so clear (and re-memoize on demand) once it gets large.
     if len(_threat_verdict) >= THREAT_CACHE_MAX:
         _threat_verdict.clear()
     _threat_verdict[ip] = hit
     return hit or None
+
+
+def threat_sources(ip):
+    """[{key,label,meaning}] for each blocklist `ip` appears on (empty if clean)."""
+    hit = threat_match(ip) or ""
+    out = []
+    for key in [k for k in hit.split(",") if k]:
+        out.append({"key": key,
+                    "label": THREAT_LABELS.get(key, key),
+                    "meaning": THREAT_MEANING.get(key, "")})
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -1022,6 +1151,16 @@ def db_init():
     con.execute("CREATE INDEX IF NOT EXISTS ix_dns_last ON dns_targets(last)")
     con.execute("""CREATE TABLE IF NOT EXISTS bypass_seen(
         dev TEXT, server TEXT, alerts INTEGER, PRIMARY KEY(dev, server))""")
+    # Security events kept across restarts so the flagged / inbound tiles survive a
+    # service restart instead of resetting to zero.
+    con.execute("""CREATE TABLE IF NOT EXISTS threat_hits(
+        dev TEXT, rem TEXT, dir TEXT, ports TEXT, hosts TEXT, lists TEXT,
+        first REAL, last REAL, count INTEGER, PRIMARY KEY(dev, rem, dir))""")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_thit_last ON threat_hits(last)")
+    con.execute("""CREATE TABLE IF NOT EXISTS inbound_hits(
+        dev TEXT, rem TEXT, ports TEXT, first REAL, last REAL, count INTEGER,
+        PRIMARY KEY(dev, rem))""")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_inb_last ON inbound_hits(last)")
     con.commit()
     con.close()
     _schema_ready = True
@@ -1056,10 +1195,37 @@ def db_load_baselines(con):
         for dev, server, alerts in con.execute(
                 "SELECT dev,server,alerts FROM bypass_seen"):
             _bypass_alert_count[(dev, server)] = alerts
+        # Reload still-current security events so the flagged / inbound counters
+        # pick up where they left off rather than showing 0 after a restart.
+        cutoff = time.time() - EVENT_RETAIN
+        _ports = lambda s: {int(p) for p in (s or "").split(",") if p.strip().isdigit()}
+        n_thit = n_inb = 0
+        try:
+            for dev, rem, dr, ports, hosts, lists, first, last, cnt in con.execute(
+                    "SELECT dev,rem,dir,ports,hosts,lists,first,last,count "
+                    "FROM threat_hits WHERE last >= ?", (cutoff,)):
+                THREAT_HITS[(dev, rem, dr)] = {
+                    "dev": dev, "rem": rem, "dir": dr, "ports": _ports(ports),
+                    "hosts": {h for h in (hosts or "").split(",") if h},
+                    "lists": lists or "", "first": first, "last": last,
+                    "count": cnt or 1}
+                n_thit += 1
+            for dev, rem, ports, first, last, cnt in con.execute(
+                    "SELECT dev,rem,ports,first,last,count FROM inbound_hits "
+                    "WHERE last >= ?", (cutoff,)):
+                INBOUND[(dev, rem)] = {
+                    "dev": dev, "rem": rem, "ports": _ports(ports),
+                    "first": first, "last": last, "count": cnt or 1}
+                n_inb += 1
+        except Exception:
+            pass
     print("  history: %d known (device,country) pairs, %d alerts, "
           "%d bypass pairs seen, %d known device MACs"
           % (len(SEEN["dev_country"]), len(ALERTS), len(_bypass_alert_count),
              len(SEEN["device"])))
+    if n_thit or n_inb:
+        print("  events restored: %d threat hit(s), %d inbound source(s) "
+              "(within the last %.1fh)" % (n_thit, n_inb, EVENT_RETAIN / 3600.0))
 
 
 def _backfill_dns_targets(con):
@@ -1121,6 +1287,16 @@ def db_worker():
             _dns_target_q.clear()
             bypass_pending = list(_bypass_persist_q)
             _bypass_persist_q.clear()
+            # Snapshot the retained security events for upsert (small: hundreds max)
+            thit_rows = [(v["dev"], v["rem"], v["dir"],
+                          ",".join(str(p) for p in sorted(v["ports"])),
+                          ",".join(sorted(v["hosts"]))[:400], v["lists"],
+                          v["first"], v["last"], v["count"])
+                         for v in THREAT_HITS.values()]
+            inb_rows = [(v["dev"], v["rem"],
+                         ",".join(str(p) for p in sorted(v["ports"])[:20]),
+                         v["first"], v["last"], v["count"])
+                        for v in INBOUND.values()]
         rows = []
         for dev, name, rem, host, g, first, last, up, down in raw:
             gg = g if g.get("status") == "ok" else {}
@@ -1155,10 +1331,29 @@ def db_worker():
                     "INSERT INTO bypass_seen(dev,server,alerts) VALUES(?,?,1)"
                     " ON CONFLICT(dev,server) DO UPDATE SET alerts=alerts+1",
                     (dev, server))
+            for r in thit_rows:
+                con.execute(
+                    "INSERT INTO threat_hits(dev,rem,dir,ports,hosts,lists,"
+                    "first,last,count) VALUES(?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(dev,rem,dir) DO UPDATE SET ports=excluded.ports,"
+                    "hosts=excluded.hosts, lists=excluded.lists,"
+                    "first=MIN(first, excluded.first), last=excluded.last,"
+                    "count=excluded.count", r)
+            for r in inb_rows:
+                con.execute(
+                    "INSERT INTO inbound_hits(dev,rem,ports,first,last,count) "
+                    "VALUES(?,?,?,?,?,?) ON CONFLICT(dev,rem) DO UPDATE SET "
+                    "ports=excluded.ports, first=MIN(first, excluded.first),"
+                    "last=excluded.last, count=excluded.count", r)
             if now - last_prune > 3600:
                 cutoff = now - RETAIN_DAYS * 86400
                 con.execute("DELETE FROM sessions WHERE last < ?", (cutoff,))
                 con.execute("DELETE FROM alerts WHERE ts < ?", (cutoff,))
+                # Events are kept a bit past their on-screen window so a quick
+                # restart still restores them; nothing older is useful.
+                ev_cutoff = now - max(EVENT_RETAIN * 2, 86400)
+                con.execute("DELETE FROM threat_hits WHERE last < ?", (ev_cutoff,))
+                con.execute("DELETE FROM inbound_hits WHERE last < ?", (ev_cutoff,))
                 # NOTE: dns_targets is deliberately NOT pruned — it's the cumulative
                 # firewall/ACL blocklist and must be a permanent record, not a
                 # rolling 30-day window (it's tiny: one row per distinct resolver).
@@ -1202,6 +1397,10 @@ BYPASS_ALERT_MAX = 2      # alerts per (device, resolver). After this the pair g
                           # resolvers still alert. Logging is never affected.
 
 
+_notify_q = []            # alerts waiting on the single notification worker
+NOTIFY_QUEUE_MAX = 200    # drop the oldest rather than grow without bound
+
+
 def _emit_alert(level, kind, dev, rem, host, msg):
     now = time.time()
     a = {"ts": now, "level": level, "kind": kind, "dev": dev,
@@ -1210,7 +1409,27 @@ def _emit_alert(level, kind, dev, rem, host, msg):
         ALERTS.append(a)
         del ALERTS[:-MAX_ALERTS]
         _alert_persist_q.append(a)
-    threading.Thread(target=notify, args=(a,), daemon=True).start()
+        # Queue for delivery instead of spawning a thread per alert: a port scan or
+        # a freshly-loaded blocklist can emit dozens at once, and one thread (plus
+        # possibly one SMTP connection) each is a thread storm on a Pi.
+        _notify_q.append(a)
+        del _notify_q[:-NOTIFY_QUEUE_MAX]
+
+
+def notify_worker():
+    """Single consumer for the notification queue. Sends are serialized, so a slow
+    or unreachable ntfy/webhook/SMTP endpoint delays notifications but can never
+    pile up threads or sockets."""
+    while True:
+        with LOCK:
+            batch = _notify_q[:]
+            del _notify_q[:]
+        for a in batch:
+            try:
+                notify(a)
+            except Exception:
+                pass          # one bad channel must never kill the worker
+        time.sleep(1.0 if not batch else 0.05)
 
 
 def alert_worker():
@@ -1236,6 +1455,30 @@ def _alert_pass(warmup):
                   for d, v in BYPASS.items()}
         inbound = [(v["dev"], v["rem"], sorted(v["ports"])[0] if v["ports"] else 0)
                    for v in INBOUND.values()]
+        # Freeze each flow's port set while we hold the lock — the capture thread
+        # mutates these sets, and iterating one unlocked can raise "set changed
+        # size during iteration".
+        cand = [(f["dev"], f["rem"], tuple(f["ports"]),
+                 f.get("host") or IPDOMAIN.get(f["rem"], ""), f["first"])
+                for f in flows]
+    # Record every current contact with a blocklisted IP as a retained event before
+    # alerting, so the flagged tile is driven by the event store (EVENT_RETAIN) and
+    # not by whether the flow happens to still be alive. threat_match scans
+    # thousands of CIDRs, so it runs with the lock released.
+    hits = []
+    for dev, rem, ports, host, first in cand:
+        th = threat_match(rem)
+        if th:
+            hits.append((dev, rem, "out", th, ports, host, first))
+    for dev, rem, port in inbound:
+        th = threat_match(rem)
+        if th:
+            hits.append((dev, rem, "in", th, (port,) if port else (), "", None))
+    if hits:
+        with LOCK:
+            for dev, rem, direction, th, ports, host, first in hits:
+                _record_threat_hit(dev, rem, direction, th, ports=ports,
+                                   host=host, ts=now, count=0, first=first)
     if True:
         # new device on the network: fires once per never-before-seen MAC. Keyed on
         # MAC (not IP) so a DHCP lease renewal on a known device doesn't re-alert,
@@ -1459,7 +1702,7 @@ def digest_data(days):
                        "SELECT dev, MAX(dev_name), SUM(up), SUM(down) FROM sessions "
                        "WHERE last>=? GROUP BY dev ORDER BY SUM(up+down) DESC "
                        "LIMIT 10", (since,))]
-        top_dst = [{"host": host or rem, "cc": cc or "", "up": up or 0,
+        top_dst = [{"ip": rem, "host": host or rem, "cc": cc or "", "up": up or 0,
                     "down": down or 0, "total": (up or 0) + (down or 0)}
                    for rem, host, cc, up, down in con.execute(
                        "SELECT rem, MAX(host), MAX(cc), SUM(up), SUM(down) "
@@ -1478,10 +1721,20 @@ def digest_data(days):
                 {"dev": dev, "dev_name": dev_name or "", "count": cnt})
         for lst in by_kind_dev.values():
             lst.sort(key=lambda x: -x["count"])
-        threats = [{"dev": nm or dev, "rem": host or rem, "country": country or cc}
-                   for dev, nm, rem, host, country, cc in con.execute(
+        # Keep the raw device IP and remote IP alongside the display strings — the
+        # dashboard needs them to open the detail drawer for a clicked threat row.
+        threats = [{"dev": nm or dev, "dev_ip": dev, "ip": rem,
+                    "rem": host or rem, "host": host or "",
+                    "country": country or cc, "cc": cc or "",
+                    "up": up or 0, "down": down or 0,
+                    "total": (up or 0) + (down or 0), "first": first, "last": last,
+                    "lists": [THREAT_LABELS.get(k, k)
+                              for k in (th or "").split(",") if k]}
+                   for dev, nm, rem, host, country, cc, up, down, first, last, th
+                   in con.execute(
                        "SELECT dev, MAX(dev_name), rem, MAX(host), MAX(country), "
-                       "MAX(cc) FROM sessions WHERE threat<>'' AND last>=? "
+                       "MAX(cc), SUM(up), SUM(down), MIN(first), MAX(last), "
+                       "MAX(threat) FROM sessions WHERE threat<>'' AND last>=? "
                        "GROUP BY dev, rem ORDER BY MAX(last) DESC LIMIT 50",
                        (since,))]
         con.close()
@@ -1523,6 +1776,123 @@ def dns_blocklist():
         out.append({"server": s, "kind": _bypass_label(k), "hits": h,
                     "block_at": at})
     return out
+
+
+_rdns_cache = {}       # ip -> PTR name or "" (memoised; bounded)
+
+
+def _rdns(ip, wait=1.5):
+    """Best-effort PTR lookup for the detail drawer, time-boxed without touching
+    socket.setdefaulttimeout (which is process-wide and would affect the geo and
+    email workers too). A slow or missing PTR just yields ""."""
+    if ip in _rdns_cache:
+        return _rdns_cache[ip]
+    box = {}
+
+    def go():
+        try:
+            box["n"] = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            box["n"] = ""
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(wait)
+    name = box.get("n", "")
+    if "n" in box:                  # only cache a completed lookup
+        if len(_rdns_cache) > 4000:
+            _rdns_cache.clear()
+        _rdns_cache[ip] = name
+    return name
+
+
+def detail_data(ip, dev=None):
+    """Everything NetWatch knows about one remote IP, for the detail drawer.
+
+    Pulls together the live flow table, the retained threat/inbound event stores,
+    30 days of session history, and every alert that mentioned the address, so
+    clicking a flagged row answers "what actually is this?" in one place."""
+    now = time.time()
+    srcs = threat_sources(ip)
+    with LOCK:
+        live = []
+        for f in FLOWS.values():
+            if f["rem"] != ip:
+                continue
+            live.append({"dev": f["dev"],
+                         "dev_name": DEV_NAMES.get(f["dev"]) or mac_vendor(f["dev"]),
+                         "ports": sorted(f["ports"])[:8], "proto": f["proto"],
+                         "up": f["up"], "down": f["down"], "pkts": f["pkts"],
+                         "first": f["first"], "last": f["last"],
+                         "active": now - f["last"] <= STALE_AFTER,
+                         "host": f.get("host") or ""})
+        events = [{"dev": v["dev"],
+                   "dev_name": DEV_NAMES.get(v["dev"]) or mac_vendor(v["dev"]),
+                   "dir": v["dir"], "ports": sorted(v["ports"])[:8],
+                   "hosts": sorted(v["hosts"]), "count": v["count"],
+                   "first": v["first"], "last": v["last"],
+                   "lists": [THREAT_LABELS.get(k, k)
+                             for k in (v["lists"] or "").split(",") if k]}
+                  for v in THREAT_HITS.values() if v["rem"] == ip]
+        inbound = [{"dev": v["dev"],
+                    "dev_name": DEV_NAMES.get(v["dev"]) or mac_vendor(v["dev"]),
+                    "ports": sorted(v["ports"])[:12], "count": v["count"],
+                    "first": v["first"], "last": v["last"]}
+                   for v in INBOUND.values() if v["rem"] == ip]
+        g = GEO.get(ip) or {}
+        geo = g if g.get("status") == "ok" else None
+        dns_host = IPDOMAIN.get(ip, "")
+        threat_ts = THREAT["ts"]
+        threat_loaded = THREAT["loaded"]
+    live.sort(key=lambda x: (-x["active"], -(x["up"] + x["down"])))
+    events.sort(key=lambda x: -x["last"])
+    inbound.sort(key=lambda x: -x["last"])
+
+    hist, alerts, totals, hosts = [], [], {}, set()
+    if dns_host:
+        hosts.add(dns_host)
+    try:
+        con = db_connect()
+        since = now - RETAIN_DAYS * 86400
+        q = ("SELECT dev, MAX(dev_name), MAX(host), MIN(first), MAX(last), "
+             "SUM(up), SUM(down), MAX(threat) FROM sessions "
+             "WHERE rem=? AND last>=? GROUP BY dev ORDER BY MAX(last) DESC")
+        for d, nm, host, first, last, up, down, th in con.execute(q, (ip, since)):
+            if host:
+                hosts.add(host)
+            hist.append({"dev": d, "dev_name": nm or "", "host": host or "",
+                         "first": first, "last": last, "up": up or 0,
+                         "down": down or 0, "threat": th or ""})
+        row = con.execute("SELECT SUM(up), SUM(down), MIN(first), MAX(last), "
+                          "COUNT(DISTINCT dev) FROM sessions WHERE rem=?",
+                          (ip,)).fetchone()
+        totals = {"up": row[0] or 0, "down": row[1] or 0,
+                  "first_seen": row[2], "last_seen": row[3],
+                  "devices": row[4] or 0}
+        for ts, level, kind, d, nm, host, msg in con.execute(
+                "SELECT ts,level,kind,dev,dev_name,host,msg FROM alerts "
+                "WHERE rem=? ORDER BY ts DESC LIMIT 40", (ip,)):
+            alerts.append({"ts": ts, "level": level, "kind": kind, "dev": d,
+                           "dev_name": nm or "", "host": host or "", "msg": msg})
+        con.close()
+    except Exception:
+        pass
+    for e in live:
+        if e["host"]:
+            hosts.add(e["host"])
+    for e in events:
+        hosts.update(e["hosts"])
+
+    return {
+        "ip": ip, "focus_dev": dev or "",
+        "geo": geo, "reverse_dns": _rdns(ip), "dns_host": dns_host,
+        "hosts": sorted(h for h in hosts if h),
+        "threat": {"listed": bool(srcs), "sources": srcs,
+                   "lists_refreshed": threat_ts, "entries": threat_loaded},
+        "live": live, "events": events, "inbound": inbound,
+        "history": hist, "alerts": alerts, "totals": totals,
+        "retain_h": round(EVENT_RETAIN / 3600.0, 1),
+        "now": now,
+    }
 
 
 def build_digest():
@@ -1599,8 +1969,13 @@ def snapshot():
         alerts = ALERTS[-60:][::-1]
         threat_stat = {"loaded": THREAT["loaded"], "ts": THREAT["ts"],
                        "error": THREAT["error"]}
-        vendors = {d: mac_vendor(d) for d in {f["dev"] for f in flows}}
+        vendors = {d: mac_vendor(d)
+                   for d in ({f["dev"] for f in flows}
+                             | {v["dev"] for v in INBOUND.values()}
+                             | {v["dev"] for v in THREAT_HITS.values()})}
         inbound_raw = [dict(v, ports=sorted(v["ports"])[:6]) for v in INBOUND.values()]
+        thits_raw = [dict(v, ports=sorted(v["ports"])[:6], hosts=sorted(v["hosts"]))
+                     for v in THREAT_HITS.values()]
 
     dests = {}
     devices = {}
@@ -1649,9 +2024,10 @@ def snapshot():
             dv["threats"] += 1
 
     dest_list = []
+    flagged_ips = set()
     for d in dests.values():
         if d["threat"]:
-            flagged += 1
+            flagged_ips.add(d["ip"])
         d["devices"] = sorted(d["devices"])
         d["ports"] = sorted(d["ports"])[:8]
         d["ndev"] = len(d["devices"])
@@ -1683,6 +2059,28 @@ def snapshot():
             "isp": gg.get("isp", ""), "threat": threat_match(v["rem"])})
     inbound.sort(key=lambda x: (-x["active"], -x["count"]))
 
+    # Retained threat-list hits. THIS is what the flagged tile counts — an event
+    # store with the same EVENT_RETAIN window as inbound, so a flagged destination
+    # no longer disappears from the counter when its flow ages out after 2 minutes.
+    flagged_events = []
+    for v in thits_raw:
+        g = geo.get(v["rem"])
+        gg = g if (g and g.get("status") == "ok") else {}
+        flagged_ips.add(v["rem"])
+        flagged_events.append({
+            "dev": v["dev"], "dev_name": names.get(v["dev"]) or vendors.get(v["dev"], ""),
+            "rem": v["rem"], "dir": v["dir"], "ports": v["ports"],
+            "host": (v["hosts"] or [""])[0], "lists": v["lists"],
+            "list_labels": [THREAT_LABELS.get(k, k)
+                            for k in v["lists"].split(",") if k],
+            "count": v["count"], "first": v["first"], "last": v["last"],
+            "age": round(now - v["last"], 1),
+            "active": now - v["last"] <= STALE_AFTER,
+            "country": gg.get("country", ""), "cc": gg.get("countryCode", ""),
+            "isp": gg.get("isp", "")})
+    flagged_events.sort(key=lambda x: (-x["active"], -x["last"]))
+    flagged = len(flagged_ips)
+
     # Top talkers by data volume
     top_devices = sorted(
         ({"ip": d["ip"], "name": d["name"] or d["vendor"] or d["ip"],
@@ -1703,9 +2101,11 @@ def snapshot():
         "stats": {"active": active_flows, "devices": len(dev_list),
                   "dests": len(dest_list), "countries": len(countries),
                   "flagged": flagged, "alerts": len(alerts),
-                  "inbound": len(inbound)},
+                  "inbound": len(inbound),
+                  "event_retain_h": round(EVENT_RETAIN / 3600.0, 1)},
         "alerts": alerts,
         "devices": dev_list, "dests": dest_list, "inbound": inbound,
+        "flagged_events": flagged_events,
         "top_devices": top_devices, "top_dests": top_dests,
     }
 
@@ -1815,15 +2215,32 @@ class Handler(BaseHTTPRequestHandler):
             body = SNAP_CACHE["bytes"]; ctype = "application/json"
         elif u.path == "/history":
             q = parse_qs(u.query)
-            hours = float(q.get("hours", ["24"])[0])
+            try:
+                hours = max(0.1, min(24.0 * RETAIN_DAYS,
+                                     float(q.get("hours", ["24"])[0])))
+            except ValueError:
+                hours = 24.0
             dev = q.get("dev", [None])[0]
             since = time.time() - hours * 3600
             body = json.dumps({"rows": db_history(since, dev)}).encode("utf-8")
             ctype = "application/json"
         elif u.path == "/digest":
             q = parse_qs(u.query)
-            days = max(1, min(90, int(float(q.get("days", ["7"])[0]))))
+            try:
+                days = max(1, min(90, int(float(q.get("days", ["7"])[0]))))
+            except ValueError:
+                days = 7
             body = json.dumps(digest_data(days)).encode("utf-8")
+            ctype = "application/json"
+        elif u.path == "/detail":              # everything known about one remote IP
+            q = parse_qs(u.query)
+            ip = (q.get("ip", [""])[0] or "").strip()
+            try:                               # validate: only ever an IP literal
+                ipaddress.ip_address(ip)
+            except ValueError:
+                self._deny(400); return
+            dev = (q.get("dev", [""])[0] or "").strip()
+            body = json.dumps(detail_data(ip, dev)).encode("utf-8")
             ctype = "application/json"
         elif u.path == "/dns":                 # instant cumulative DNS blocklist
             body = json.dumps({"dns_targets": dns_blocklist()}).encode("utf-8")
@@ -1976,6 +2393,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .tile.alert{cursor:pointer} .tile.alert:hover{background:#3a2a10}
   .tile.flagged b{color:var(--bad)}
   .tile.inbound b{color:var(--warn)}
+  .tile.jump{cursor:pointer}
+  .tile.jump:hover{background:#3a2a2a}
+  /* flagged (retained threat event) rows */
+  .flg{padding:8px 12px;border-bottom:1px solid #262623;border-left:3px solid var(--bad);
+    cursor:pointer}
+  .flg:hover{background:var(--surface-3)}
+  .flg .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+  .flg .nm{font-weight:600;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .flg .meta{color:var(--text-secondary);font-size:12px;margin-top:1px}
+  .flg .ipline{color:var(--text-muted);font-size:11px;font-family:Consolas,ui-monospace,monospace;margin-top:1px}
+  .flg .when{color:var(--text-muted);font-size:11px;flex:none}
+  .lst{font-size:9px;padding:1px 5px;border-radius:4px;background:#4a2020;color:#ff9d9d;
+    font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+  .dirb{font-size:9px;padding:1px 5px;border-radius:4px;background:var(--surface-3);
+    color:var(--text-secondary);font-weight:600;text-transform:uppercase}
+  .inb,.al{cursor:pointer}
+  .al:hover,.inb:hover{background:var(--surface-3)}
+  .info{margin-left:auto;color:var(--text-muted);font-size:11px;border:1px solid var(--border);
+    border-radius:5px;padding:0 5px;flex:none;cursor:pointer}
+  .info:hover{border-color:var(--series-1);color:var(--text-primary)}
   .vendor{color:var(--text-muted);font-weight:400;font-size:11px}
   /* top talkers */
   .tt-row{padding:7px 12px;border-bottom:1px solid #262623}
@@ -2047,7 +2484,52 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .al .m{margin-top:2px} .al .w{color:var(--text-muted);font-size:11px;margin-top:2px}
   .hist .top{display:flex;justify-content:space-between;gap:8px}
   .hist .when{color:var(--text-muted);font-size:11px}
-  @media (max-width:900px){main{grid-template-columns:1fr}aside{display:none}}
+  /* ---- detail drawer (one remote IP, everything we know) ---- */
+  #detail{position:absolute;top:0;right:0;width:460px;max-width:96vw;height:100%;z-index:1700;
+    background:var(--surface-2);border-left:1px solid var(--border);box-shadow:-8px 0 28px #000a;
+    transform:translateX(100%);transition:transform .18s ease;display:flex;flex-direction:column}
+  #detail.open{transform:none}
+  #detail .hd{display:flex;justify-content:space-between;align-items:center;gap:8px;
+    padding:12px 14px;border-bottom:1px solid var(--border);font-weight:600}
+  #detail .hd .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #detail .hd button{background:none;border:none;color:var(--text-muted);font-size:18px;
+    cursor:pointer;flex:none}
+  #detailBody{overflow-y:auto;flex:1;padding:0 0 40px}
+  .dt-verdict{padding:12px 14px;border-bottom:1px solid var(--border)}
+  .dt-verdict.bad{background:#2a1414;border-left:3px solid var(--bad)}
+  .dt-verdict.ok{background:#16221a;border-left:3px solid var(--good)}
+  .dt-verdict b{display:block;font-size:14px;margin-bottom:3px}
+  .dt-verdict p{margin:5px 0 0;color:var(--text-secondary);font-size:12px}
+  .dt-kv{display:grid;grid-template-columns:104px 1fr;gap:3px 10px;padding:10px 14px;
+    border-bottom:1px solid var(--border);font-size:12px}
+  .dt-kv dt{color:var(--text-muted)}
+  .dt-kv dd{margin:0;overflow-wrap:anywhere}
+  .dt-mono{font-family:Consolas,ui-monospace,monospace}
+  .dt-row{padding:8px 14px;border-bottom:1px solid #262623;font-size:12px}
+  .dt-row .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+  .dt-row b{font-weight:600}
+  .dt-row .sub{color:var(--text-muted);font-size:11px;margin-top:2px}
+  .dt-empty{padding:10px 14px;color:var(--text-muted);font-size:12px}
+  .dt-actions{display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--border)}
+  .dt-actions button{background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
+    border-radius:7px;padding:5px 10px;font:inherit;font-size:11px;cursor:pointer}
+  .dt-actions button:hover{border-color:var(--series-1);color:var(--text-primary)}
+  /* ---- small screens: stack the panel under the map instead of hiding it ---- */
+  @media (max-width:900px){
+    main{grid-template-columns:1fr;grid-template-rows:34vh minmax(0,1fr)}
+    #map{min-height:0}
+    aside{border-left:none;border-top:1px solid var(--border);min-height:0}
+    header{gap:6px;padding:7px 9px}
+    #ver{display:none}
+    .pill{font-size:10px;padding:2px 8px}
+    .tiles{gap:5px;width:100%;margin-left:0}
+    .tile{min-width:0;padding:3px 7px;text-align:center}
+    .tile b{font-size:14px}
+    .tile small{font-size:9px;letter-spacing:0;white-space:nowrap}
+    #digestBtn,#alertBtn,#quitBtn{padding:5px 8px}
+    #detail,#alerts,#digest{width:100%;max-width:100%}
+    #banner{top:auto;bottom:12px}
+  }
 </style>
 </head>
 <body>
@@ -2062,8 +2544,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="tile"><b id="tActive">–</b><small>active flows</small></div>
       <div class="tile"><b id="tDevices">–</b><small>devices</small></div>
       <div class="tile"><b id="tDests">–</b><small>destinations</small></div>
-      <div class="tile flagged"><b id="tFlagged">–</b><small>flagged</small></div>
-      <div class="tile inbound"><b id="tInbound">–</b><small>inbound</small></div>
+      <div class="tile flagged jump" id="tileFlagged"
+        title="Blocklisted IPs seen recently — click to jump to the list">
+        <b id="tFlagged">–</b><small>flagged</small></div>
+      <div class="tile inbound jump" id="tileInbound"
+        title="Unsolicited inbound sources seen recently — click to jump to the list">
+        <b id="tInbound">–</b><small>inbound</small></div>
       <button id="digestBtn" title="Show a summary">&#9776; digest</button>
       <button id="alertBtn" title="Show alerts">&#9873; alerts<span class="n" id="alertN" style="display:none">0</span></button>
       <button id="quitBtn" title="Stop NetWatch">&#10005; quit</button>
@@ -2098,6 +2584,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button data-view="dns">DNS list</button>
   </div>
   <div id="digestBody"><div class="empty">Loading&hellip;</div></div>
+</div>
+<div id="detail">
+  <div class="hd"><span class="t" id="detailTitle">Details</span>
+    <button id="detailClose" title="Close (Esc)">&times;</button></div>
+  <div id="detailBody"><div class="dt-empty">Loading&hellip;</div></div>
 </div>
 <div id="banner"></div>
 <div id="stopped"><div><b>NetWatch stopped</b>You can close this tab.</div></div>
@@ -2136,6 +2627,19 @@ function colorFor(ip){
 function flag(cc){if(!cc||cc.length!==2)return "";
   return String.fromCodePoint(...[...cc.toUpperCase()].map(c=>127397+c.charCodeAt(0)));}
 function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+// Replace a scrollable list's contents without yanking the user's scroll position
+// back to the top on every 2.5s poll, and skip the DOM work entirely when the
+// markup hasn't changed (the common case between ticks).
+function setHTML(el,html){
+  if(!el)return;
+  if(el.dataset.sig===html)return;
+  const y=el.scrollTop;
+  el.innerHTML=html;
+  el.dataset.sig=html;
+  if(y)el.scrollTop=y;
+}
+const IPRE=/^(\d{1,3}(\.\d{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:.]*)$/;
+function isIP(s){return !!s&&IPRE.test(String(s).trim());}
 function arcPoints(a,b){let lon2=b[1];if(Math.abs(lon2-a[1])>180)lon2+=(a[1]>lon2?360:-360);
   const p0=a,p2=[b[0],lon2],mx=(p0[0]+p2[0])/2,my=(p0[1]+p2[1])/2,dx=p2[0]-p0[0],dy=p2[1]-p0[1];
   const dist=Math.hypot(dx,dy)||1,bow=Math.min(dist*0.18,14),c=[mx+(-dy/dist)*bow,my+(dx/dist)*bow],pts=[];
@@ -2172,6 +2676,14 @@ function render(d){
   document.getElementById("tDests").textContent=d.stats.dests;
   document.getElementById("tFlagged").textContent=d.stats.flagged;
   document.getElementById("tInbound").textContent=d.stats.inbound||0;
+  // Both counters are event counters over the SAME retention window, so flagged can
+  // never drain faster than inbound. Say so in the tooltip.
+  const rh=d.stats.event_retain_h||6;
+  document.getElementById("tileFlagged").title=
+    "Blocklisted IPs contacted in the last "+rh+"h (kept "+rh
+    +"h after the last sighting) — click to jump to the list";
+  document.getElementById("tileInbound").title=
+    "Unsolicited inbound sources in the last "+rh+"h — click to jump to the list";
 
   const th=d.threat||{}, thp=document.getElementById("threatPill"), tht=document.getElementById("threatTxt");
   if(th.loaded){thp.style.display="";thp.className="pill"+(d.stats.flagged?" bad":"");
@@ -2259,13 +2771,30 @@ function bypassBadges(dv){
 }
 
 function inboundRow(ib){
-  return '<div class="inb'+(ib.threat?" bad":"")+'"><div class="nm">'
+  return '<div class="inb'+(ib.threat?" bad":"")+'" data-ip="'+esc(ib.rem)+'" data-dev="'
+    +esc(ib.dev)+'" title="Click for details"><div class="nm">'
     +(ib.threat?'<span class="badge2 threat">&#9888; flagged</span> ':"")
     +flag(ib.cc)+" "+esc(ib.rem)+"</div>"
     +'<div class="meta">to <b>'+esc(ib.dev_name||ib.dev)+"</b> on port"+(ib.ports.length>1?"s":"")
     +" "+ib.ports.join(", ")+(ib.country?" &middot; from "+esc(ib.country):"")+"</div>"
     +'<div class="ipline">'+ib.count+" attempt"+(ib.count===1?"":"s")
     +(ib.isp?" &middot; "+esc(ib.isp):"")+"</div></div>";
+}
+
+// A retained threat-list hit. These come from the server's event store, not the
+// live flow table, so a flagged destination stays listed for the full retention
+// window (same one inbound uses) instead of vanishing when the flow ages out.
+function flaggedRow(fe){
+  const lists=(fe.list_labels||[]).map(l=>'<span class="lst">'+esc(l)+"</span>").join(" ");
+  const dir=fe.dir==="in"?'<span class="dirb">inbound</span>':'<span class="dirb">outbound</span>';
+  return '<div class="flg" data-ip="'+esc(fe.rem)+'" data-dev="'+esc(fe.dev)
+    +'" title="Click for details"><div class="top"><div class="nm">'
+    +flag(fe.cc)+" "+esc(fe.host||fe.rem)+" "+dir+" "+lists+"</div>"
+    +'<div class="when">'+ago(fe.last)+"</div></div>"
+    +'<div class="meta">'+(fe.dir==="in"?"to ":"")+"<b>"+esc(fe.dev_name||fe.dev)+"</b>"
+    +(fe.ports.length?" &middot; port"+(fe.ports.length>1?"s":"")+" "+fe.ports.join(", "):"")
+    +(fe.country?" &middot; "+esc(fe.country):"")+"</div>"
+    +'<div class="ipline">'+esc(fe.rem)+(fe.isp?" &middot; "+esc(fe.isp):"")+"</div></div>";
 }
 
 function renderList(){
@@ -2276,6 +2805,20 @@ function renderList(){
   const list=document.getElementById("list");
   let html="";
 
+  const rh=(latest.stats&&latest.stats.event_retain_h)||6;
+
+  // Flagged (threat-list) hits, retained for the same window as inbound.
+  if(latest.flagged_events && latest.flagged_events.length){
+    const fe=latest.flagged_events.filter(x=>{
+      const hay=(x.rem+" "+(x.host||"")+" "+(x.dev_name||x.dev)+" "
+        +(x.country||"")+" "+(x.list_labels||[]).join(" ")).toLowerCase();
+      return !q||hay.includes(q);
+    });
+    if(fe.length)
+      html+='<div class="section-hd" id="secFlagged"><span>&#9888; Flagged &middot; last '
+        +rh+"h</span></div>"+fe.map(flaggedRow).join("");
+  }
+
   // Inbound connection attempts (usually empty behind NAT; shown when present)
   if(latest.inbound && latest.inbound.length){
     const ib=latest.inbound.filter(x=>{
@@ -2283,8 +2826,8 @@ function renderList(){
       return !q||hay.includes(q);
     });
     if(ib.length)
-      html+='<div class="section-hd"><span>&#9888; Inbound connections</span></div>'
-        +ib.map(inboundRow).join("");
+      html+='<div class="section-hd" id="secInbound"><span>&#9888; Inbound connections &middot; last '
+        +rh+"h</span></div>"+ib.map(inboundRow).join("");
   }
 
   const drows=[];
@@ -2313,7 +2856,8 @@ function renderList(){
     if(q && !hay.includes(q)) continue;
     const tb=x.threat?'<span class="badge2 threat">&#9888; flagged</span> ':"";
     rrows.push('<div class="row'+(x.active?"":" off")+(x.threat?" flag":"")+'" data-dest="'+esc(x.ip)+'">'
-      +'<div class="top"><div class="nm">'+tb+esc(x.host||g.country||x.ip)+"</div>"
+      +'<div class="top"><div class="nm">'+tb+esc(x.host||g.country||x.ip)
+      +'<span class="info" data-ip="'+esc(x.ip)+'" title="What is this?">&#9432;</span></div>'
       +'<div class="cnt">'+x.ndev+" dev"+(x.ndev===1?"":"s")+"</div></div>"
       +'<div class="loc">'+flag(g.countryCode)+" "+esc(g.city?g.city+", ":"")
       +(g.country?esc(g.country):"locating&hellip;")+(g.isp?' &middot; <span style="color:var(--text-muted)">'+esc(g.isp)+"</span>":"")+"</div>"
@@ -2323,16 +2867,24 @@ function renderList(){
   html+='<div class="section-hd"><span>Destinations'+(selDev?" &middot; "+esc(devLabel(selDev)):"")+"</span></div>"
     +(rrows.length?rrows.join(""):'<div class="empty">'+(q?"No matches.":"No destinations yet&hellip;")+"</div>");
 
-  list.innerHTML=html;
+  setHTML(list,html);
 }
 
 function renderAlerts(alerts){
   const el=document.getElementById("alertList");
-  if(!alerts.length){el.innerHTML='<div class="empty">No alerts yet.</div>';return;}
-  el.innerHTML=alerts.map(a=>'<div class="al '+esc(a.level)+'"><div class="k">'
-    +esc(a.kind.replace(/_/g," "))+" &middot; "+ago(a.ts)+"</div>"
-    +'<div class="m"><b>'+esc(a.dev_name||a.dev)+"</b> "+esc(a.msg)+"</div>"
-    +(a.host||a.rem?'<div class="w">'+esc(a.host||a.rem)+"</div>":"")+"</div>").join("");
+  if(!alerts.length){setHTML(el,'<div class="empty">No alerts yet.</div>');return;}
+  // Alerts whose subject is an IP (threat hits, inbound, new destination) are
+  // clickable straight through to the detail drawer.
+  setHTML(el,alerts.map(a=>{
+    const ip=isIP(a.rem)?a.rem:"";
+    return '<div class="al '+esc(a.level)+'"'
+      +(ip?' data-ip="'+esc(ip)+'" data-dev="'+esc(a.dev||"")+'" title="Click for details"'
+          :' style="cursor:default"')
+      +'><div class="k">'+esc(a.kind.replace(/_/g," "))+" &middot; "+ago(a.ts)
+      +(ip?' &middot; <span style="color:var(--series-1)">details</span>':"")+"</div>"
+      +'<div class="m"><b>'+esc(a.dev_name||a.dev)+"</b> "+esc(a.msg)+"</div>"
+      +(a.host||a.rem?'<div class="w">'+esc(a.host||a.rem)+"</div>":"")+"</div>";
+  }).join(""));
 }
 
 // ---- History view ----
@@ -2356,9 +2908,9 @@ function renderHistory(){
     +'<div class="when">'+ago(r.last)+"</div></div>"
     +'<div class="loc">'+flag(r.cc)+" "+esc(r.country||"")+" &middot; "+esc(r.dev_name||r.dev)+"</div>"
     +'<div class="bytes">&#8593; '+fmtBytes(r.up)+" &nbsp; &#8595; "+fmtBytes(r.down)+"</div></div>").join("");
-  list.innerHTML='<div class="section-hd"><span>History &middot; last 24h'
+  setHTML(list,'<div class="section-hd"><span>History &middot; last 24h'
     +(selDev?" &middot; "+esc(devLabel(selDev)):"")+"</span></div>"
-    +(rows||'<div class="empty">No history in this window yet.</div>');
+    +(rows||'<div class="empty">No history in this window yet.</div>'));
 }
 
 function renderTop(){
@@ -2375,12 +2927,13 @@ function renderTop(){
     +'<div class="updown">&#8593; '+fmtBytes(x.up)+" &nbsp; &#8595; "+fmtBytes(x.down)+"</div></div>").join("")
     :'<div class="empty">No traffic yet&hellip;</div>';
   html+='<div class="section-hd"><span>Top destinations by volume</span></div>';
-  html+=ds.length?ds.map(x=>'<div class="tt-row"><div class="top"><div class="nm">'
+  html+=ds.length?ds.map(x=>'<div class="tt-row" data-ip="'+esc(x.ip)+'" style="cursor:pointer"'
+    +' title="Click for details"><div class="top"><div class="nm">'
     +flag(x.cc)+" "+esc(x.host)+'</div><div class="tot">'+fmtBytes(x.total)+"</div></div>"
     +bar(x.total,maxT,"")
     +'<div class="updown">&#8593; '+fmtBytes(x.up)+" &nbsp; &#8595; "+fmtBytes(x.down)+"</div></div>").join("")
     :'<div class="empty">No traffic yet&hellip;</div>';
-  list.innerHTML=html;
+  setHTML(list,html);
 }
 
 let mode="live";
@@ -2397,13 +2950,26 @@ document.getElementById("segTop").addEventListener("click",()=>setMode("top"));
 
 document.getElementById("list").addEventListener("click",e=>{
   if(e.target.id==="clearSel"){selDev=null;wipeLayers();render(latest);return;}
+  // Anything carrying data-ip (flagged rows, inbound rows, the ⓘ chip on a
+  // destination, top-talker rows) opens the detail drawer for that remote IP.
+  const iprow=e.target.closest("[data-ip]");
+  if(iprow){openDetail(iprow.dataset.ip,iprow.dataset.dev||"");return;}
   const drow=e.target.closest("[data-dev]");
   if(drow){selDev=(selDev===drow.dataset.dev)?null:drow.dataset.dev;wipeLayers();
     if(mode==="hist")loadHistory(); else render(latest);return;}
   const rrow=e.target.closest("[data-dest]");
   if(rrow){const e2=layers.get(rrow.dataset.dest);
-    if(e2&&map){map.flyTo(e2.marker.getLatLng(),Math.max(map.getZoom(),5));e2.marker.openTooltip();}}
+    if(e2&&map){map.flyTo(e2.marker.getLatLng(),Math.max(map.getZoom(),5));e2.marker.openTooltip();}
+    else openDetail(rrow.dataset.dest,"");}
 });
+function jumpTo(id){
+  setMode("live");
+  const go=()=>{const el=document.getElementById(id);
+    if(el&&el.scrollIntoView)el.scrollIntoView({block:"start",behavior:"smooth"});};
+  setTimeout(go,30);
+}
+document.getElementById("tileFlagged").addEventListener("click",()=>jumpTo("secFlagged"));
+document.getElementById("tileInbound").addEventListener("click",()=>jumpTo("secInbound"));
 function wipeLayers(){for(const [ip,e] of layers){map.removeLayer(e.marker);
   if(e.arc)map.removeLayer(e.arc);}layers.clear();}
 document.getElementById("q").addEventListener("input",()=>{mode==="hist"?renderHistory():renderList();});
@@ -2448,6 +3014,8 @@ function mergeAlertGroups(d){
     .sort((a,b)=>b.count-a.count);
 }
 document.getElementById("digestBody").addEventListener("click",e=>{
+  const iprow=e.target.closest("[data-ip]");
+  if(iprow){openDetail(iprow.dataset.ip,iprow.dataset.dev||"");return;}
   const row=e.target.closest("[data-gi]");
   if(!row)return;
   const box=document.getElementById("kinddevs_"+row.dataset.gi);
@@ -2485,7 +3053,8 @@ async function loadDigest(){
     +'<div class="updown">&#8593; '+fmtBytes(x.up)+" &nbsp; &#8595; "+fmtBytes(x.down)+"</div></div>").join("")
     :'<div class="empty">No traffic in this window.</div>';
   h+='<div class="section-hd"><span>Top destinations</span></div>';
-  h+=d.top_dests.length?d.top_dests.map(x=>'<div class="tt-row"><div class="top">'
+  h+=d.top_dests.length?d.top_dests.map(x=>'<div class="tt-row" data-ip="'+esc(x.ip||"")
+    +'" style="cursor:pointer" title="Click for details"><div class="top">'
     +'<div class="nm">'+flag(x.cc)+" "+esc(x.host)+'</div><div class="tot">'+fmtBytes(x.total)+"</div></div>"+bar(x.total,maxT)+"</div>").join("")
     :"";
   h+='<div class="section-hd"><span>Alerts ('+d.alerts_total+")</span></div>";
@@ -2496,10 +3065,18 @@ async function loadDigest(){
     :'<div class="empty">No alerts in this window.</div>';
   if(d.threats.length){
     h+='<div class="section-hd"><span>&#9888; Threat-list hits ('+d.threats.length+")</span></div>";
-    h+=d.threats.slice(0,20).map(t=>'<div class="row flag"><div class="nm">'+esc(t.dev)
-      +" &rarr; "+esc(t.rem)+'</div><div class="ipline">'+esc(t.country||"")+"</div></div>").join("");
+    h+='<div class="dg-note">Click any row to see what the address is, which '
+      +'blocklist flagged it, and every time your network touched it.</div>';
+    h+=d.threats.slice(0,25).map(t=>'<div class="row flag" data-ip="'+esc(t.ip||"")
+      +'" data-dev="'+esc(t.dev_ip||"")+'" title="Click for details">'
+      +'<div class="top"><div class="nm">'+esc(t.dev)+" &rarr; "+esc(t.rem)
+      +'</div><div class="cnt">'+fmtBytes(t.total||0)+"</div></div>"
+      +'<div class="loc">'+flag(t.cc)+" "+esc(t.country||"")+" "
+      +(t.lists||[]).map(l=>'<span class="lst">'+esc(l)+"</span>").join(" ")+"</div>"
+      +'<div class="ipline">'+esc(t.ip||"")+(t.last?" &middot; "+ago(t.last):"")
+      +'</div></div>').join("");
   }
-  document.getElementById("digestBody").innerHTML=h;
+  setHTML(document.getElementById("digestBody"),h);
 }
 function dnsSection(title,note,id,items){
   if(!items.length)
@@ -2559,6 +3136,155 @@ document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",
   if(b.dataset.view==="dns"){ loadDNS(); }
   else { digestDays=+b.dataset.days; loadDigest(); }
 }));
+
+// ---- Detail drawer: everything known about one remote IP -------------------
+const detailPanel=document.getElementById("detail");
+let detailIP=null;
+function closeDetail(){detailPanel.classList.remove("open");detailIP=null;}
+document.getElementById("detailClose").addEventListener("click",closeDetail);
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape")return;
+  if(detailPanel.classList.contains("open"))closeDetail();
+  else if(digestPanel.classList.contains("open"))digestPanel.classList.remove("open");
+  else if(alertsPanel.classList.contains("open"))alertsPanel.classList.remove("open");
+});
+async function openDetail(ip,dev){
+  if(!ip)return;
+  detailIP=ip;
+  document.getElementById("detailTitle").textContent=ip;
+  const body=document.getElementById("detailBody");
+  body.dataset.sig="";
+  body.innerHTML='<div class="dt-empty">Loading&hellip;</div>';
+  detailPanel.classList.add("open");
+  let d;
+  try{
+    d=await (await fetch("/detail?ip="+encodeURIComponent(ip)
+      +(dev?"&dev="+encodeURIComponent(dev):""),{cache:"no-store"})).json();
+  }catch(e){
+    body.innerHTML='<div class="dt-empty">Could not load details for this address.</div>';
+    return;
+  }
+  if(detailIP!==ip)return;              // a newer click won the race
+  renderDetail(d);
+}
+function dtRow(inner){return '<div class="dt-row">'+inner+"</div>";}
+function renderDetail(d){
+  const g=d.geo||{}, t=d.threat||{}, tot=d.totals||{};
+  const title=(d.hosts&&d.hosts[0])||d.reverse_dns||d.ip;
+  document.getElementById("detailTitle").textContent=title===d.ip?d.ip:title+" ("+d.ip+")";
+  let h="";
+
+  // Verdict first: is this thing actually bad, and according to whom?
+  if(t.listed){
+    h+='<div class="dt-verdict bad"><b>&#9888; On '+t.sources.length+" public blocklist"
+      +(t.sources.length===1?"":"s")+"</b>"
+      +t.sources.map(s=>'<p><b style="display:inline">'+esc(s.label)+"</b> &mdash; "
+        +esc(s.meaning)+"</p>").join("")
+      +'<p style="color:var(--text-muted)">Lists last refreshed '
+      +(t.lists_refreshed?ago(t.lists_refreshed):"never")+" &middot; "
+      +(t.entries||0).toLocaleString()+" entries loaded.</p></div>";
+  }else{
+    h+='<div class="dt-verdict ok"><b>Not on any loaded blocklist</b>'
+      +'<p>This address did not match Tor exit nodes, FireHOL level 1, or Spamhaus '
+      +"DROP as of the last refresh"
+      +(t.lists_refreshed?" ("+ago(t.lists_refreshed)+")":"")+".</p></div>";
+  }
+
+  // Identity
+  h+='<dl class="dt-kv">'
+    +"<dt>Address</dt><dd class=\"dt-mono\">"+esc(d.ip)+"</dd>"
+    +(d.hosts&&d.hosts.length?"<dt>Hostname(s)</dt><dd>"+d.hosts.map(esc).join("<br>")+"</dd>":"")
+    +(d.reverse_dns?"<dt>Reverse DNS</dt><dd class=\"dt-mono\">"+esc(d.reverse_dns)+"</dd>":"")
+    +"<dt>Location</dt><dd>"+(g.country?flag(g.countryCode)+" "+esc(g.city?g.city+", ":"")
+      +esc(g.region?g.region+", ":"")+esc(g.country):"unknown / not geolocated")+"</dd>"
+    +(g.isp?"<dt>ISP</dt><dd>"+esc(g.isp)+"</dd>":"")
+    +(g.org&&g.org!==g.isp?"<dt>Organisation</dt><dd>"+esc(g.org)+"</dd>":"")
+    +"<dt>Total traffic</dt><dd>&#8593; "+fmtBytes(tot.up||0)+" &nbsp; &#8595; "
+      +fmtBytes(tot.down||0)+"</dd>"
+    +(tot.first_seen?"<dt>First seen</dt><dd>"+ago(tot.first_seen)+"</dd>":"")
+    +(tot.last_seen?"<dt>Last seen</dt><dd>"+ago(tot.last_seen)+"</dd>":"")
+    +"</dl>";
+
+  h+='<div class="dt-actions">'
+    +(g.lat!==undefined?'<button data-act="map">Show on map</button>':"")
+    +'<button data-act="filter">Filter the dashboard to this</button>'
+    +'<button data-act="copy">Copy address</button></div>';
+
+  // Retained threat events for this address
+  h+='<div class="section-hd"><span>Flagged contacts ('+(d.events||[]).length
+    +") &middot; last "+(d.retain_h||6)+"h</span></div>";
+  h+=(d.events&&d.events.length)?d.events.map(e=>dtRow(
+    '<div class="top"><b>'+esc(e.dev_name||e.dev)+"</b><span class=\"sub\">"
+    +ago(e.last)+"</span></div>"
+    +'<div class="sub">'+(e.dir==="in"?"inbound to this device":"outbound from this device")
+    +(e.ports.length?" &middot; port"+(e.ports.length>1?"s":"")+" "+e.ports.join(", "):"")
+    +" &middot; first seen "+ago(e.first)+"</div>")).join("")
+    :'<div class="dt-empty">No retained flagged contacts for this address.</div>';
+
+  // Live flows right now
+  h+='<div class="section-hd"><span>Live flows ('+(d.live||[]).length+")</span></div>";
+  h+=(d.live&&d.live.length)?d.live.map(f=>dtRow(
+    '<div class="top"><b>'+esc(f.dev_name||f.dev)+"</b><span class=\"sub\">"
+    +(f.active?"active":ago(f.last))+"</span></div>"
+    +'<div class="sub">'+esc(f.proto)+(f.ports.length?" :"+f.ports.join(" :"):"")
+    +" &middot; &#8593; "+fmtBytes(f.up)+" &#8595; "+fmtBytes(f.down)+"</div>")).join("")
+    :'<div class="dt-empty">Nothing talking to this address right now.</div>';
+
+  // Unsolicited inbound from this address
+  if(d.inbound&&d.inbound.length){
+    h+='<div class="section-hd"><span>&#9888; Unsolicited inbound ('+d.inbound.length+")</span></div>";
+    h+=d.inbound.map(i=>dtRow(
+      '<div class="top"><b>'+esc(i.dev_name||i.dev)+"</b><span class=\"sub\">"
+      +ago(i.last)+"</span></div>"
+      +'<div class="sub">'+i.count+" attempt"+(i.count===1?"":"s")
+      +(i.ports.length?" &middot; port"+(i.ports.length>1?"s":"")+" "+i.ports.join(", "):"")
+      +"</div>")).join("");
+  }
+
+  // Per-device history over the retention window
+  h+='<div class="section-hd"><span>History by device ('+(d.history||[]).length+")</span></div>";
+  h+=(d.history&&d.history.length)?d.history.map(r=>dtRow(
+    '<div class="top"><b>'+esc(r.dev_name||r.dev)+"</b><span class=\"sub\">"
+    +ago(r.last)+"</span></div>"
+    +'<div class="sub">&#8593; '+fmtBytes(r.up)+" &#8595; "+fmtBytes(r.down)
+    +" &middot; first "+ago(r.first)+(r.threat?" &middot; flagged":"")+"</div>")).join("")
+    :'<div class="dt-empty">No stored history for this address.</div>';
+
+  // Alerts that named this address
+  h+='<div class="section-hd"><span>Related alerts ('+(d.alerts||[]).length+")</span></div>";
+  h+=(d.alerts&&d.alerts.length)?d.alerts.map(a=>
+    '<div class="al '+esc(a.level)+'" style="cursor:default"><div class="k">'
+    +esc(a.kind.replace(/_/g," "))+" &middot; "+ago(a.ts)+"</div>"
+    +'<div class="m"><b>'+esc(a.dev_name||a.dev)+"</b> "+esc(a.msg)+"</div></div>").join("")
+    :'<div class="dt-empty">No alerts recorded for this address.</div>';
+
+  const body=document.getElementById("detailBody");
+  body.innerHTML=h;
+  body.dataset.sig="";
+  body.querySelectorAll("[data-act]").forEach(b=>b.addEventListener("click",()=>{
+    const act=b.dataset.act;
+    if(act==="copy"){
+      const done=()=>{b.textContent="Copied!";setTimeout(()=>{b.textContent="Copy address";},1500);};
+      if(navigator.clipboard&&navigator.clipboard.writeText)
+        navigator.clipboard.writeText(d.ip).then(done).catch(()=>fallbackCopy(d.ip,done,b));
+      else fallbackCopy(d.ip,done,b);
+    }else if(act==="filter"){
+      document.getElementById("q").value=d.ip;
+      setMode("live");renderList();closeDetail();
+      digestPanel.classList.remove("open");alertsPanel.classList.remove("open");
+    }else if(act==="map"){
+      const e2=layers.get(d.ip);
+      if(e2&&map){map.flyTo(e2.marker.getLatLng(),Math.max(map.getZoom(),5));
+        e2.marker.openTooltip();}
+      else if(map&&d.geo)map.flyTo([d.geo.lat,d.geo.lon],5);
+      closeDetail();digestPanel.classList.remove("open");alertsPanel.classList.remove("open");
+    }
+  }));
+}
+document.getElementById("alertList").addEventListener("click",e=>{
+  const row=e.target.closest("[data-ip]");
+  if(row)openDetail(row.dataset.ip,row.dataset.dev||"");
+});
 
 let quitting=false;
 document.getElementById("quitBtn").addEventListener("click",async()=>{
@@ -2634,6 +3360,7 @@ def main():
     threading.Thread(target=db_worker, name="db", daemon=True).start()
     threading.Thread(target=seen_writer, name="seen", daemon=True).start()
     threading.Thread(target=alert_worker, name="alert", daemon=True).start()
+    threading.Thread(target=notify_worker, name="notify", daemon=True).start()
     threading.Thread(target=digest_worker, name="digest", daemon=True).start()
     threading.Thread(target=snapshot_worker, name="snapshot", daemon=True).start()
     threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
