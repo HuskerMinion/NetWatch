@@ -34,6 +34,7 @@ sent to ip-api.com for geolocation, cached locally in netwatch_geo_cache.json.
 """
 
 import argparse
+import hmac
 import ipaddress
 import json
 import os
@@ -57,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.06.1"  # date + same-day build number, so successive changes on
+VERSION = "2026.08.20.1"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -75,6 +76,7 @@ OUI_REFRESH = 30 * 86400
 DIGEST_INTERVAL = 7 * 86400
 DIGEST_STATE = os.path.join(HERE, "netwatch_digest.json")
 NAMES_FILE = os.path.join(HERE, "netwatch_names.json")  # manual MAC/IP -> name map
+NOTES_FILE = os.path.join(HERE, "netwatch_notes.json")  # dest IP/host/*.suffix -> note
 
 STALE_AFTER = 10       # seconds since last packet -> flow shown as fading
 DROP_AFTER = 120       # seconds since last packet -> flow removed
@@ -97,6 +99,20 @@ DB_FLUSH_EVERY = 20
 RETAIN_DAYS = 30
 MAX_ALERTS = 300
 THREAT_CACHE_MAX = 50000   # cap the threat-match memo cache (bounds long-run memory)
+
+# --- process attribution (optional per-PC agent; see netwatch_agent.py) -------
+AGENT_TTL = 900        # a reported socket->process mapping is trusted this long
+AGENT_MAX = 20000      # cap on mappings held in memory (oldest dropped first)
+
+# --- per-device behavioural profile ("fingerprint") --------------------------
+PROFILE_INTERVAL = 300     # seconds between fingerprint passes
+PROFILE_MIN_HOURS = 24     # hours of history required before deviations alert
+PROFILE_VOL_FACTOR = 3.0   # hourly bytes above baseline_max * this = anomaly
+PROFILE_VOL_FLOOR = 10 * 1024 * 1024   # ...but never alert under this absolute
+PROFILE_DEST_FACTOR = 4.0  # distinct destinations in an hour vs baseline max
+PROFILE_DEST_FLOOR = 25    # ...but never alert under this absolute
+PROFILE_MAX_PORTS = 200    # cap the learned per-device port set
+DEVIATION_RETAIN = 7 * 86400   # how long a recorded deviation stays queryable
 
 # Public resolvers commonly hardcoded by devices to bypass a local DNS filter.
 DOH_IPS = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9",
@@ -155,6 +171,12 @@ INBOUND = {}    # (dev, rem) -> {dev, rem, ports:set, first, last, count}
 # for hours like its alert does instead of disappearing when the flow ages out.
 THREAT_HITS = {}  # (dev, rem, dir) -> {dev, rem, dir, ports:set, hosts:set,
                   #                     lists:str, first, last, count}
+NOTES = {}      # dest key (IP / hostname / *.suffix) -> user note text
+PROCS = {}      # (dev, rem, port) -> {"proc", "pid", "ts"} from a per-PC agent
+AGENTS = {}     # dev IP -> {"host", "os", "last", "n"} agent check-in state
+IPV6 = {}       # dev -> {"rem", "last", "count"} global IPv6 traffic seen
+PROFILE = {}    # dev -> learned behavioural profile (built by fingerprint_worker)
+DEVIATIONS = [] # recent profile deviations, newest last (also persisted)
 HOME = None
 GEO_STATE = "waiting"
 CAP_STATE = {"iface": "", "pkts": 0, "pps": 0.0, "drops": 0, "error": None,
@@ -177,6 +199,15 @@ _PRIV = [ipaddress.ip_network(n) for n in (
 
 def is_private_lan(a):
     return any(a in n for n in _PRIV)
+
+
+def v6_prefix(ip):
+    """The /64 an IPv6 address sits in, used to group leak alerts so one device
+    chatting to a dozen addresses at one provider doesn't produce a dozen alerts."""
+    try:
+        return str(ipaddress.ip_network(ip + "/64", strict=False).network_address)
+    except ValueError:
+        return ip
 
 
 def classify(src, dst):
@@ -645,6 +676,8 @@ def _prune(now):
         for k in [k for k, v in THREAT_HITS.items()
                   if now - v["last"] > EVENT_RETAIN]:
             del THREAT_HITS[k]
+        for k in [k for k, v in IPV6.items() if now - v["last"] > EVENT_RETAIN]:
+            del IPV6[k]
         if len(THREAT_HITS) > THREAT_HIT_MAX:
             for k, _ in sorted(THREAT_HITS.items(), key=lambda kv: kv[1]["last"]
                                )[:len(THREAT_HITS) - THREAT_HIT_MAX]:
@@ -806,6 +839,190 @@ def name_worker():
                 if not DEV_NAMES.get(ip):
                     DEV_NAMES[ip] = name or ""
         time.sleep(5)
+
+
+# ----------------------------------------------------------------------------
+# Destination notes — annotate a remote IP / hostname / domain suffix
+# ----------------------------------------------------------------------------
+# Same shape as the manual device-name map, but for the OTHER end of the flow:
+# "this IP is my Syncthing relay", "this host is the TV's telemetry". Notes ride
+# along in the snapshot so a known-good destination stops looking suspicious
+# every time you glance at the list.
+
+def _note_key(k):
+    """Normalize a note key: IPs and hostnames lowercase, '*.x.com' kept as a
+    suffix rule. Returns '' for anything that isn't a plausible key."""
+    k = (k or "").strip().lower().rstrip(".")
+    if not k or len(k) > 253:
+        return ""
+    if k.startswith("*."):
+        body = k[2:]
+        return k if body and re.match(r"^[a-z0-9.\-]+$", body) else ""
+    try:
+        ipaddress.ip_address(k)
+        return k
+    except ValueError:
+        pass
+    return k if re.match(r"^[a-z0-9.\-]+$", k) else ""
+
+
+def load_notes():
+    """Load netwatch_notes.json ({key: note}). Missing file is fine; a malformed
+    one is reported and ignored rather than taking the dashboard down."""
+    try:
+        with open(NOTES_FILE, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print("notes: could not read %s (%s) - ignoring" % (NOTES_FILE, e),
+              file=sys.stderr)
+        return {}
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k.startswith("_") or not isinstance(v, str) or not v.strip():
+                continue                       # skip comment keys / blank values
+            nk = _note_key(k)
+            if nk:
+                out[nk] = v.strip()[:200]
+    return out
+
+
+def note_for(ip, host="", notes=None):
+    """Note for a destination: exact IP wins, then exact hostname, then the
+    longest matching '*.suffix' rule. '' when nothing matches."""
+    notes = NOTES if notes is None else notes
+    if not notes:
+        return ""
+    if ip and ip in notes:
+        return notes[ip]
+    h = (host or "").strip().lower().rstrip(".")
+    if h:
+        if h in notes:
+            return notes[h]
+        best = ""
+        for k in notes:
+            if (k.startswith("*.") and (h == k[2:] or h.endswith(k[1:]))
+                    and len(k) > len(best)):
+                best = k
+        if best:
+            return notes[best]
+    return ""
+
+
+def save_note(key, text):
+    """Write one note through to netwatch_notes.json (empty text deletes it).
+    Rewrites the whole small file atomically; the hot-reloader picks it up."""
+    nk = _note_key(key)
+    if not nk:
+        raise ValueError("bad note key")
+    try:
+        with open(NOTES_FILE, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            raw = {}
+    except FileNotFoundError:
+        raw = {}
+    except Exception:
+        raw = {}
+    text = (text or "").strip()[:200]
+    existing = {k: v for k, v in raw.items() if _note_key(k) != nk or k.startswith("_")}
+    if text:
+        existing[nk] = text
+    tmp = NOTES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(existing, fh, indent=2, sort_keys=True)
+    os.replace(tmp, NOTES_FILE)
+    with LOCK:
+        NOTES.clear()
+        NOTES.update(load_notes())
+    return text
+
+
+def notes_worker():
+    """Hot-reload the notes file whenever it changes on disk, so editing it by
+    hand works exactly like editing netwatch_names.json."""
+    global NOTES
+    mtime = None
+    while True:
+        try:
+            m = os.path.getmtime(NOTES_FILE)
+        except OSError:
+            m = None
+        if m != mtime:
+            loaded = load_notes()
+            with LOCK:
+                NOTES.clear()
+                NOTES.update(loaded)
+            mtime = m
+        _beat("notes")
+        time.sleep(5)
+
+
+# ----------------------------------------------------------------------------
+# Process attribution (optional per-PC agent)
+# ----------------------------------------------------------------------------
+# A mirrored port can never see WHICH program opened a socket — that lives only
+# on the machine itself. netwatch_agent.py runs on a PC you care about and posts
+# its socket->process table here; we join on (device, remote, port) so those
+# flows gain a process name while every other device keeps working as before.
+
+def agent_ingest(dev, payload):
+    """Merge one agent check-in. `dev` is the peer address of the POST (trusted
+    over anything the body claims). Returns the number of mappings accepted."""
+    now = time.time()
+    conns = payload.get("conns") or []
+    n = 0
+    with LOCK:
+        AGENTS[dev] = {"host": str(payload.get("host", ""))[:64],
+                       "os": str(payload.get("os", ""))[:32],
+                       "last": now, "n": len(conns)}
+        for c in conns:
+            try:
+                rem = str(c.get("rem", ""))
+                port = int(c.get("port", 0))
+                proc = str(c.get("proc", ""))[:64]
+            except (TypeError, ValueError):
+                continue
+            if not rem or not proc:
+                continue
+            try:
+                if not ipaddress.ip_address(rem).is_global:
+                    continue          # only public destinations are ever mapped
+            except ValueError:
+                continue
+            pid = c.get("pid")
+            PROCS[(dev, rem, port)] = {"proc": proc, "ts": now,
+                                       "pid": pid if isinstance(pid, int) else None}
+            n += 1
+        if len(PROCS) > AGENT_MAX:
+            for k, _ in sorted(PROCS.items(),
+                               key=lambda kv: kv[1]["ts"])[:len(PROCS) - AGENT_MAX]:
+                del PROCS[k]
+    return n
+
+
+def proc_for(dev, rem, ports=()):
+    """Process name behind a flow, or '' when no agent covers that device.
+    Tries each port the flow used, then any port for the (device, remote) pair."""
+    now = time.time()
+    for p in ports:
+        e = PROCS.get((dev, rem, p))
+        if e and now - e["ts"] <= AGENT_TTL:
+            return e["proc"]
+    for (d, r, _p), e in PROCS.items():
+        if d == dev and r == rem and now - e["ts"] <= AGENT_TTL:
+            return e["proc"]
+    return ""
+
+
+def _prune_procs(now):
+    with LOCK:
+        for k in [k for k, v in PROCS.items() if now - v["ts"] > AGENT_TTL]:
+            del PROCS[k]
+        for d in [d for d, v in AGENTS.items() if now - v["last"] > AGENT_TTL]:
+            del AGENTS[d]
 
 
 # ----------------------------------------------------------------------------
@@ -1161,9 +1378,41 @@ def db_init():
         dev TEXT, rem TEXT, ports TEXT, first REAL, last REAL, count INTEGER,
         PRIMARY KEY(dev, rem))""")
     con.execute("CREATE INDEX IF NOT EXISTS ix_inb_last ON inbound_hits(last)")
+    # Hourly per-device rollup that the behavioural profile is computed from.
+    # One row per (device, hour) — tiny, and it makes the fingerprint pass a few
+    # indexed reads instead of a scan over every session ever recorded.
+    con.execute("""CREATE TABLE IF NOT EXISTS dev_hourly(
+        dev TEXT, hour INTEGER, bytes INTEGER, dests INTEGER, flows INTEGER,
+        PRIMARY KEY(dev, hour))""")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_hourly_hour ON dev_hourly(hour)")
+    con.execute("""CREATE TABLE IF NOT EXISTS dev_profile(
+        dev TEXT PRIMARY KEY, first REAL, last REAL, hours INTEGER, hod TEXT,
+        ports TEXT, max_bytes INTEGER, max_dests INTEGER, avg_bytes REAL,
+        updated REAL)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS deviations(
+        ts REAL, dev TEXT, kind TEXT, detail TEXT, value REAL, baseline REAL)""")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_dev_ts ON deviations(ts)")
+    # Upgrade path: older databases have a sessions table without `ports`.
+    _add_column(con, "sessions", "ports", "TEXT")
     con.commit()
     con.close()
     _schema_ready = True
+
+
+def _add_column(con, table, col, decl):
+    """Idempotent ALTER TABLE ... ADD COLUMN, so upgrading in place never needs
+    the user to delete netwatch.db."""
+    try:
+        have = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
+    except Exception:
+        return False
+    if col in have:
+        return False
+    try:
+        con.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, decl))
+        return True
+    except Exception:
+        return False
 
 
 def db_connect():
@@ -1260,6 +1509,39 @@ def _backfill_dns_targets(con):
         print("  backfilled DNS-server list from %d historical bypass alerts" % n)
 
 
+_flow_bytes = {}     # (dev,rem,first) -> bytes counted so far, for hourly deltas
+_hour_dests = {"hour": 0, "map": {}}   # distinct destinations per device this hour
+
+
+def _rollup_hourly(rows, now):
+    """Turn this pass's absolute session totals into per-device, per-hour byte
+    DELTAS. Attributing a whole session to one hour would make a long download
+    look like a spike in whichever hour it happened to end in; taking the
+    difference since the previous pass puts the bytes in the hour they moved."""
+    hour = int(now // 3600)
+    if _hour_dests["hour"] != hour:
+        _hour_dests["hour"], _hour_dests["map"] = hour, {}
+    agg = {}
+    live = set()
+    for r in rows:
+        dev, rem, first = r[0], r[2], r[6]
+        key = (dev, rem, first)
+        live.add(key)
+        total = (r[8] or 0) + (r[9] or 0)
+        prev = _flow_bytes.get(key, 0)
+        delta = total - prev if total >= prev else total
+        _flow_bytes[key] = total
+        a = agg.setdefault(dev, {"bytes": 0, "flows": 0})
+        a["bytes"] += delta
+        a["flows"] += 1
+        _hour_dests["map"].setdefault(dev, set()).add(rem)
+    for key in [k for k in _flow_bytes if k not in live]:
+        del _flow_bytes[key]
+    return hour, [(dev, hour, a["bytes"],
+                   len(_hour_dests["map"].get(dev, ())), a["flows"])
+                  for dev, a in agg.items()]
+
+
 def db_worker():
     try:
         con = db_connect()
@@ -1280,7 +1562,9 @@ def db_worker():
             raw = [(f["dev"], DEV_NAMES.get(f["dev"]) or mac_vendor(f["dev"]), f["rem"],
                     f.get("host") or IPDOMAIN.get(f["rem"], ""),
                     (GEO.get(f["rem"]) or {}), f["first"], f["last"],
-                    f["up"], f["down"]) for f in FLOWS.values()]
+                    f["up"], f["down"],
+                    ",".join(str(p) for p in sorted(f["ports"])[:12]))
+                   for f in FLOWS.values()]
             pending = list(_alert_persist_q)
             _alert_persist_q.clear()
             dns_pending = list(_dns_target_q)
@@ -1298,11 +1582,11 @@ def db_worker():
                          v["first"], v["last"], v["count"])
                         for v in INBOUND.values()]
         rows = []
-        for dev, name, rem, host, g, first, last, up, down in raw:
+        for dev, name, rem, host, g, first, last, up, down, ports in raw:
             gg = g if g.get("status") == "ok" else {}
             rows.append((dev, name, rem, host, gg.get("country", ""),
                          gg.get("countryCode", ""), first, last, up, down,
-                         threat_match(rem) or ""))
+                         threat_match(rem) or "", ports))
         try:
             # Keep one row per (dev,rem,first) session, updated in place.
             for r in rows:
@@ -1311,7 +1595,8 @@ def db_worker():
                     (r[0], r[2], r[6]))
                 con.execute(
                     "INSERT INTO sessions(dev,dev_name,rem,host,country,cc,"
-                    "first,last,up,down,threat) VALUES(?,?,?,?,?,?,?,?,?,?,?)", r)
+                    "first,last,up,down,threat,ports) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", r)
             for a in pending:
                 con.execute(
                     "INSERT INTO alerts(ts,level,kind,dev,dev_name,rem,host,msg)"
@@ -1339,6 +1624,12 @@ def db_worker():
                     "hosts=excluded.hosts, lists=excluded.lists,"
                     "first=MIN(first, excluded.first), last=excluded.last,"
                     "count=excluded.count", r)
+            for r in _rollup_hourly(rows, now)[1]:
+                con.execute(
+                    "INSERT INTO dev_hourly(dev,hour,bytes,dests,flows) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(dev,hour) DO UPDATE SET "
+                    "bytes=bytes+excluded.bytes, dests=MAX(dests,excluded.dests),"
+                    "flows=MAX(flows,excluded.flows)", r)
             for r in inb_rows:
                 con.execute(
                     "INSERT INTO inbound_hits(dev,rem,ports,first,last,count) "
@@ -1354,6 +1645,12 @@ def db_worker():
                 ev_cutoff = now - max(EVENT_RETAIN * 2, 86400)
                 con.execute("DELETE FROM threat_hits WHERE last < ?", (ev_cutoff,))
                 con.execute("DELETE FROM inbound_hits WHERE last < ?", (ev_cutoff,))
+                con.execute("DELETE FROM deviations WHERE ts < ?",
+                            (now - DEVIATION_RETAIN,))
+                # The hourly rollup follows the same 30-day window as sessions;
+                # the profile derived from it (dev_profile) is cumulative.
+                con.execute("DELETE FROM dev_hourly WHERE hour < ?",
+                            (int(cutoff // 3600),))
                 # NOTE: dns_targets is deliberately NOT pruned — it's the cumulative
                 # firewall/ACL blocklist and must be a permanent record, not a
                 # rolling 30-day window (it's tiny: one row per distinct resolver).
@@ -1366,8 +1663,8 @@ def db_worker():
 def db_history(since, dev=None, limit=500):
     try:
         con = db_connect()
-        q = ("SELECT dev,dev_name,rem,host,country,cc,first,last,up,down,threat "
-             "FROM sessions WHERE last >= ?")
+        q = ("SELECT dev,dev_name,rem,host,country,cc,first,last,up,down,threat,"
+             "COALESCE(ports,'') FROM sessions WHERE last >= ?")
         args = [since]
         if dev:
             q += " AND dev = ?"
@@ -1377,10 +1674,186 @@ def db_history(since, dev=None, limit=500):
         rows = con.execute(q, args).fetchall()
         con.close()
         cols = ["dev", "dev_name", "rem", "host", "country", "cc", "first",
-                "last", "up", "down", "threat"]
+                "last", "up", "down", "threat", "ports"]
         return [dict(zip(cols, r)) for r in rows]
     except Exception:
         return []
+
+
+# ----------------------------------------------------------------------------
+# Device behavioural profile ("fingerprint") + deviation detection
+# ----------------------------------------------------------------------------
+# A mirrored port sees devices, not processes, so instead of fingerprinting an
+# application we fingerprint a DEVICE: the hours it is normally awake, the ports
+# it normally uses, how much it normally moves in an hour and how many distinct
+# destinations it normally touches. IoT gear is boringly consistent, which makes
+# a deviation genuinely interesting — a doorbell that suddenly uploads 200 MB at
+# 3am to fifty new hosts is exactly the shape of a compromise.
+
+def _hod(hour):
+    """Local hour-of-day (0-23) for an absolute epoch-hour number."""
+    try:
+        return time.localtime(hour * 3600).tm_hour
+    except (OSError, ValueError, OverflowError):
+        return hour % 24
+
+
+def _hod_add(bitmap, h):
+    b = list((bitmap or "0" * 24).ljust(24, "0")[:24])
+    if 0 <= h < 24:
+        b[h] = "1"
+    return "".join(b)
+
+
+def _ports_union(stored, new_ports):
+    have = {p for p in (stored or "").split(",") if p}
+    have |= {str(p) for p in new_ports if str(p).isdigit()}
+    return ",".join(sorted(have, key=lambda x: int(x))[:PROFILE_MAX_PORTS])
+
+
+def profile_pass(con, now=None):
+    """One fingerprint pass: refresh every device's learned profile from the
+    hourly rollup, then compare the hour in progress against it. Returns the
+    list of deviation dicts found this pass (already recorded, not yet alerted).
+    Kept a pure function of (connection, clock) so tests can drive it."""
+    now = time.time() if now is None else now
+    cur_hour = int(now // 3600)
+    profiles = {}
+    for dev, first, last, hours, hod, ports, mx, mxd, avg, upd in con.execute(
+            "SELECT dev,first,last,hours,hod,ports,max_bytes,max_dests,"
+            "avg_bytes,updated FROM dev_profile"):
+        profiles[dev] = {"dev": dev, "first": first, "last": last,
+                         "hours": hours or 0, "hod": hod or "0" * 24,
+                         "ports": ports or "", "max_bytes": mx or 0,
+                         "max_dests": mxd or 0, "avg_bytes": avg or 0.0,
+                         "updated": upd or 0}
+
+    # Baseline from COMPLETED hours only — the hour in progress is what we are
+    # testing, so folding it into its own baseline would hide every anomaly.
+    stats = {}
+    for dev, n, mx, mxd, avg in con.execute(
+            "SELECT dev, COUNT(*), MAX(bytes), MAX(dests), AVG(bytes) "
+            "FROM dev_hourly WHERE hour < ? GROUP BY dev", (cur_hour,)):
+        stats[dev] = (n or 0, mx or 0, mxd or 0, avg or 0.0)
+
+    hod_seen = {}
+    for dev, hour in con.execute(
+            "SELECT dev, hour FROM dev_hourly WHERE hour < ? AND bytes > 0",
+            (cur_hour,)):
+        hod_seen.setdefault(dev, set()).add(_hod(hour))
+
+    # Ports used since the last pass, so the learned set grows without ever
+    # re-reading the whole sessions table.
+    port_new = {}
+    for dev, ports in con.execute(
+            "SELECT dev, COALESCE(ports,'') FROM sessions WHERE last >= ?",
+            (now - 2 * PROFILE_INTERVAL,)):
+        s = port_new.setdefault(dev, set())
+        for p in (ports or "").split(","):
+            if p.isdigit():
+                s.add(p)
+
+    current = {}
+    for dev, b, d in con.execute(
+            "SELECT dev, bytes, dests FROM dev_hourly WHERE hour = ?", (cur_hour,)):
+        current[dev] = (b or 0, d or 0)
+
+    found = []
+    for dev in set(stats) | set(current) | set(profiles):
+        p = profiles.get(dev) or {"dev": dev, "first": now, "hours": 0,
+                                  "hod": "0" * 24, "ports": "", "max_bytes": 0,
+                                  "max_dests": 0, "avg_bytes": 0.0}
+        n, mx, mxd, avg = stats.get(dev, (0, 0, 0, 0.0))
+        hod = p["hod"]
+        for h in hod_seen.get(dev, ()):
+            hod = _hod_add(hod, h)
+        cur_bytes, cur_dests = current.get(dev, (0, 0))
+        mature = n >= PROFILE_MIN_HOURS
+
+        if mature and cur_bytes > max(mx * PROFILE_VOL_FACTOR, PROFILE_VOL_FLOOR):
+            found.append({"dev": dev, "kind": "volume", "value": cur_bytes,
+                          "baseline": mx, "hour": cur_hour,
+                          "detail": "moved %s this hour; its busiest hour on "
+                                    "record is %s" % (_fmt_bytes(cur_bytes),
+                                                      _fmt_bytes(mx))})
+        if mature and cur_dests > max(mxd * PROFILE_DEST_FACTOR, PROFILE_DEST_FLOOR):
+            found.append({"dev": dev, "kind": "dests", "value": cur_dests,
+                          "baseline": mxd, "hour": cur_hour,
+                          "detail": "reached %d distinct destinations this hour; "
+                                    "its widest hour on record is %d"
+                                    % (cur_dests, mxd)})
+        # Off-hours needs a full week before it means anything — a device simply
+        # hasn't had the chance to be seen at 4am until it has lived through one.
+        if n >= 7 * 24 and cur_bytes > 0:
+            h_now = _hod(cur_hour)
+            if hod[h_now] != "1":
+                found.append({"dev": dev, "kind": "hours", "value": h_now,
+                              "baseline": -1, "hour": cur_hour,
+                              "detail": "active at %02d:00 — an hour it has never "
+                                        "been active before" % h_now})
+        known_ports = {x for x in (p["ports"] or "").split(",") if x}
+        fresh = sorted(port_new.get(dev, set()) - known_ports, key=int)
+        if mature and fresh:
+            found.append({"dev": dev, "kind": "port", "value": int(fresh[0]),
+                          "baseline": len(known_ports), "hour": cur_hour,
+                          "detail": "used port %s for the first time"
+                                    % ", ".join(fresh[:5])})
+
+        # Persist the refreshed profile. Ports are unioned in AFTER the
+        # comparison above, so a brand-new port is reported exactly once.
+        hod = _hod_add(hod, _hod(cur_hour)) if cur_bytes > 0 else hod
+        merged = {"dev": dev, "first": p.get("first") or now, "last": now,
+                  "hours": n, "hod": hod,
+                  "ports": _ports_union(p["ports"], port_new.get(dev, set())),
+                  "max_bytes": max(mx, p["max_bytes"]),
+                  "max_dests": max(mxd, p["max_dests"]),
+                  "avg_bytes": avg, "updated": now}
+        con.execute(
+            "INSERT INTO dev_profile(dev,first,last,hours,hod,ports,max_bytes,"
+            "max_dests,avg_bytes,updated) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(dev) DO UPDATE SET last=excluded.last,"
+            "hours=excluded.hours, hod=excluded.hod, ports=excluded.ports,"
+            "max_bytes=excluded.max_bytes, max_dests=excluded.max_dests,"
+            "avg_bytes=excluded.avg_bytes, updated=excluded.updated",
+            (dev, merged["first"], merged["last"], merged["hours"], merged["hod"],
+             merged["ports"], merged["max_bytes"], merged["max_dests"],
+             merged["avg_bytes"], merged["updated"]))
+        profiles[dev] = merged
+
+    for d in found:
+        con.execute("INSERT INTO deviations(ts,dev,kind,detail,value,baseline) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (now, d["dev"], d["kind"], d["detail"], d["value"],
+                     d["baseline"]))
+    con.commit()
+    with LOCK:
+        PROFILE.clear()
+        PROFILE.update(profiles)
+        for d in found:
+            DEVIATIONS.append(dict(d, ts=now))
+        del DEVIATIONS[:-200]
+    return found
+
+
+def fingerprint_worker():
+    """Refresh device profiles and alert on deviations. Deliberately slow (every
+    PROFILE_INTERVAL) — this is a trend detector, not a live path."""
+    time.sleep(30)                     # let the first sessions land
+    while True:
+        try:
+            _beat("fingerprint")
+            con = db_connect()
+            try:
+                found = profile_pass(con)
+            finally:
+                con.close()
+            names = dict(DEV_NAMES)
+            for d in found:
+                _fire("profile_" + d["kind"], d["dev"], str(d["hour"]), "", None,
+                      names, False, msg=d["detail"])
+        except Exception as e:
+            print("  fingerprint pass failed (%s)" % e)
+        time.sleep(PROFILE_INTERVAL)
 
 
 # ----------------------------------------------------------------------------
@@ -1492,6 +1965,25 @@ def _alert_pass(warmup):
             if mac:
                 _fire("device", dev, mac, "", None, names, learning,
                       msg="new device joined the network (MAC %s)" % mac)
+        # IPv6 leak. This network is deliberately v4-only (the DNS/DoH/DoT ACLs
+        # on the gateway are v4 rules), so a device reaching a global v6 address
+        # is either misconfigured or routing straight around those rules.
+        if CONF.get("alert_ipv6", True):
+            v6 = [(d, r) for d, r, _p, _h, _f in cand if ":" in r]
+            if v6:
+                with LOCK:
+                    for d, r in v6:
+                        e6 = IPV6.get(d)
+                        if e6 is None:
+                            IPV6[d] = {"rem": r, "last": now, "count": 1}
+                        else:
+                            e6["rem"] = r
+                            e6["last"] = now
+                            e6["count"] += 1
+                for d, r in v6:
+                    _fire("ipv6", d, v6_prefix(r), "", None, names, learning,
+                          msg="IPv6 traffic to %s — IPv6 is supposed to be "
+                              "disabled on this network" % r)
         # unsolicited inbound connection attempts (someone connecting TO us)
         for dev, rem, port in inbound:
             th = threat_match(rem)
@@ -1563,6 +2055,17 @@ def _fire(kind, dev, key, host, cc, names, learning, msg):
         if learning:
             return
         level = "warning"
+    elif kind == "ipv6":
+        # IPv6 is meant to be off on this network, so any global v6 traffic is a
+        # misconfiguration (or a device routing around the v4 firewall rules).
+        if learning:
+            return
+        level, rem_field = "warning", key
+    elif kind.startswith("profile_"):
+        # Behavioural deviation from the device's learned fingerprint.
+        if learning:
+            return
+        level = "warning" if kind == "profile_volume" else "notice"
     else:
         return
     # DNS-bypass: cap per (device, resolver) instead of the generic once-per-window
@@ -1882,10 +2385,21 @@ def detail_data(ip, dev=None):
     for e in events:
         hosts.update(e["hosts"])
 
+    host_list = sorted(h for h in hosts if h)
+    with LOCK:
+        procs = sorted({v["proc"] for (d, r, _p), v in PROCS.items()
+                        if r == ip and now - v["ts"] <= AGENT_TTL
+                        and (not dev or d == dev)})
+        note = note_for(ip, host_list[0] if host_list else "", dict(NOTES))
     return {
         "ip": ip, "focus_dev": dev or "",
         "geo": geo, "reverse_dns": _rdns(ip), "dns_host": dns_host,
-        "hosts": sorted(h for h in hosts if h),
+        "note": note, "procs": procs,
+        "hosts": host_list,
+        # Edit the key the note is actually stored under, so saving from the
+        # drawer updates the existing note instead of quietly creating a second
+        # one under the hostname.
+        "note_key": (ip if ip in NOTES or not host_list else host_list[0]),
         "threat": {"listed": bool(srcs), "sources": srcs,
                    "lists_refreshed": threat_ts, "entries": threat_loaded},
         "live": live, "events": events, "inbound": inbound,
@@ -1893,6 +2407,155 @@ def detail_data(ip, dev=None):
         "retain_h": round(EVENT_RETAIN / 3600.0, 1),
         "now": now,
     }
+
+
+def viz_data(hours=24):
+    """Aggregates behind the Visualizations panel — four different questions
+    asked of the same window, all answered in SQL so a 7-day view costs about
+    what an hour does.
+
+      constellation : who talks to whom (device -> destination, by volume)
+      flow          : where the bytes go (device -> country)
+      weather       : when the network is busy (per-hour activity + alerts)
+      fingerprint   : what "normal" looks like per device, and what broke it
+    """
+    now = time.time()
+    since = now - hours * 3600
+    out = {"hours": hours, "generated": now,
+           "constellation": {"devices": [], "links": []},
+           "flow": {"devices": [], "countries": [], "links": []},
+           "weather": {"buckets": [], "peak": 0},
+           "fingerprint": {"devices": [], "deviations": []}}
+    try:
+        con = db_connect()
+    except Exception:
+        return out
+    try:
+        names = {}
+        for dev, nm in con.execute(
+                "SELECT dev, MAX(COALESCE(dev_name,'')) FROM sessions "
+                "WHERE last >= ? GROUP BY dev", (since,)):
+            names[dev] = nm or ""
+
+        # ---- constellation: top devices, each with its top destinations ------
+        devs = []
+        for dev, tot, ndest in con.execute(
+                "SELECT dev, SUM(up+down), COUNT(DISTINCT rem) FROM sessions "
+                "WHERE last >= ? GROUP BY dev ORDER BY 2 DESC LIMIT 10", (since,)):
+            devs.append({"ip": dev, "name": names.get(dev) or dev,
+                         "bytes": tot or 0, "ndest": ndest or 0})
+        out["constellation"]["devices"] = devs
+        keep = {d["ip"] for d in devs}
+        per_dev = {}
+        for dev, node, b, cc, threat, host in con.execute(
+                "SELECT dev, COALESCE(NULLIF(host,''), rem) AS node, "
+                "SUM(up+down) AS b, MAX(COALESCE(cc,'')), MAX(COALESCE(threat,'')), "
+                "MAX(COALESCE(host,'')) FROM sessions WHERE last >= ? "
+                "GROUP BY dev, node ORDER BY b DESC", (since,)):
+            if dev not in keep:
+                continue
+            lst = per_dev.setdefault(dev, [])
+            if len(lst) >= 8:
+                continue
+            lst.append({"dev": dev, "node": node, "bytes": b or 0,
+                        "cc": cc or "", "threat": threat or "",
+                        "host": host or ""})
+        for lst in per_dev.values():
+            out["constellation"]["links"].extend(lst)
+
+        # ---- flow: device -> country, bytes -------------------------------
+        pairs = con.execute(
+            "SELECT dev, COALESCE(NULLIF(country,''),'Unknown'), SUM(up+down) "
+            "FROM sessions WHERE last >= ? GROUP BY 1,2", (since,)).fetchall()
+        dev_tot, cc_tot = {}, {}
+        for dev, country, b in pairs:
+            dev_tot[dev] = dev_tot.get(dev, 0) + (b or 0)
+            cc_tot[country] = cc_tot.get(country, 0) + (b or 0)
+        top_dev = [d for d, _ in sorted(dev_tot.items(), key=lambda kv: -kv[1])[:8]]
+        top_cc = [c for c, _ in sorted(cc_tot.items(), key=lambda kv: -kv[1])[:8]]
+        links = {}
+        for dev, country, b in pairs:
+            d = dev if dev in top_dev else "other"
+            c = country if country in top_cc else "Other"
+            links[(d, c)] = links.get((d, c), 0) + (b or 0)
+        out["flow"]["devices"] = [
+            {"ip": d, "name": (names.get(d) or d) if d != "other" else "other",
+             "bytes": dev_tot.get(d, sum(v for k, v in links.items() if k[0] == "other"))}
+            for d in (top_dev + (["other"] if len(dev_tot) > len(top_dev) else []))]
+        out["flow"]["countries"] = [
+            {"name": c, "bytes": cc_tot.get(c, sum(v for k, v in links.items()
+                                                   if k[1] == "Other"))}
+            for c in (top_cc + (["Other"] if len(cc_tot) > len(top_cc) else []))]
+        out["flow"]["links"] = [{"dev": k[0], "country": k[1], "bytes": v}
+                                for k, v in sorted(links.items(), key=lambda kv: -kv[1])]
+
+        # ---- weather: per-hour activity ------------------------------------
+        h0, h1 = int(since // 3600), int(now // 3600)
+        by_hour = {}
+        for h, b, nd in con.execute(
+                "SELECT hour, SUM(bytes), SUM(dests) FROM dev_hourly "
+                "WHERE hour >= ? GROUP BY hour", (h0,)):
+            by_hour[h] = [b or 0, nd or 0, 0, 0]
+        if not by_hour:
+            # dev_hourly only fills going forward; fall back to session rows so
+            # the view isn't blank on a freshly upgraded install.
+            for h, b, nd in con.execute(
+                    "SELECT CAST(last/3600 AS INTEGER) h, SUM(up+down), "
+                    "COUNT(DISTINCT rem) FROM sessions WHERE last >= ? "
+                    "GROUP BY h", (since,)):
+                by_hour[h] = [b or 0, nd or 0, 0, 0]
+        for h, n in con.execute(
+                "SELECT CAST(last/3600 AS INTEGER) h, COUNT(DISTINCT dev) "
+                "FROM sessions WHERE last >= ? GROUP BY h", (since,)):
+            by_hour.setdefault(h, [0, 0, 0, 0])[2] = n or 0
+        for h, n in con.execute(
+                "SELECT CAST(ts/3600 AS INTEGER) h, COUNT(*) FROM alerts "
+                "WHERE ts >= ? GROUP BY h", (since,)):
+            by_hour.setdefault(h, [0, 0, 0, 0])[3] = n or 0
+        buckets = []
+        for h in range(h0, h1 + 1):
+            b, nd, ndev, na = by_hour.get(h, [0, 0, 0, 0])
+            buckets.append({"hour": h, "ts": h * 3600, "hod": _hod(h),
+                            "bytes": b, "dests": nd, "devices": ndev,
+                            "alerts": na})
+        out["weather"]["buckets"] = buckets
+        out["weather"]["peak"] = max([x["bytes"] for x in buckets] or [0])
+
+        # ---- fingerprint: learned profile per device + deviations ----------
+        cur_hour = int(now // 3600)
+        cur = {}
+        for dev, b, nd in con.execute(
+                "SELECT dev, bytes, dests FROM dev_hourly WHERE hour = ?",
+                (cur_hour,)):
+            cur[dev] = (b or 0, nd or 0)
+        rows = []
+        for (dev, first, last, hrs, hod, ports, mx, mxd, avg) in con.execute(
+                "SELECT dev,first,last,hours,hod,ports,max_bytes,max_dests,"
+                "avg_bytes FROM dev_profile ORDER BY max_bytes DESC LIMIT 40"):
+            cb, cd = cur.get(dev, (0, 0))
+            plist = [p for p in (ports or "").split(",") if p]
+            rows.append({"ip": dev, "name": names.get(dev) or dev,
+                         "first": first, "last": last, "hours": hrs or 0,
+                         "hod": (hod or "0" * 24), "ports": plist[:24],
+                         "nports": len(plist), "max_bytes": mx or 0,
+                         "max_dests": mxd or 0, "avg_bytes": avg or 0.0,
+                         "cur_bytes": cb, "cur_dests": cd,
+                         "mature": (hrs or 0) >= PROFILE_MIN_HOURS})
+        out["fingerprint"]["devices"] = rows
+        for ts, dev, kind, detail, val, base in con.execute(
+                "SELECT ts,dev,kind,detail,value,baseline FROM deviations "
+                "WHERE ts >= ? ORDER BY ts DESC LIMIT 60", (since,)):
+            out["fingerprint"]["deviations"].append(
+                {"ts": ts, "dev": dev, "name": names.get(dev) or dev,
+                 "kind": kind, "detail": detail, "value": val, "baseline": base})
+    except Exception as e:
+        out["error"] = str(e)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return out
 
 
 def build_digest():
@@ -1976,6 +2639,15 @@ def snapshot():
         inbound_raw = [dict(v, ports=sorted(v["ports"])[:6]) for v in INBOUND.values()]
         thits_raw = [dict(v, ports=sorted(v["ports"])[:6], hosts=sorted(v["hosts"]))
                      for v in THREAT_HITS.values()]
+        notes_map = dict(NOTES)
+        # Flatten the agent's socket table to (device, remote) -> process once,
+        # instead of scanning it per flow.
+        proc_idx = {}
+        for (_d, _r, _p), _v in PROCS.items():
+            if now - _v["ts"] <= AGENT_TTL:
+                proc_idx.setdefault((_d, _r), _v["proc"])
+        agents = [dict(v, ip=d) for d, v in AGENTS.items()]
+        ipv6_raw = [dict(v, dev=d) for d, v in IPV6.items()]
 
     dests = {}
     devices = {}
@@ -1996,7 +2668,13 @@ def snapshot():
         d = dests.setdefault(f["rem"], {
             "ip": f["rem"], "geo": None, "host": host, "devices": set(),
             "ports": set(), "pkts": 0, "up": 0, "down": 0, "active": False,
-            "threat": threat, "last": f["last"]})
+            "threat": threat, "last": f["last"],
+            "note": note_for(f["rem"], host, notes_map), "procs": set()})
+        if not d["note"] and host:
+            d["note"] = note_for(f["rem"], host, notes_map)
+        pname = proc_idx.get((f["dev"], f["rem"]))
+        if pname:
+            d["procs"].add(pname)
         d["geo"] = ({k: gg[k] for k in ("lat", "lon", "city", "region",
                     "country", "countryCode", "isp", "org")} if gg else None)
         if host and not d["host"]:
@@ -2013,7 +2691,8 @@ def snapshot():
             "ip": f["dev"], "name": names.get(f["dev"]) or "",
             "vendor": vendors.get(f["dev"], ""), "dests": set(),
             "pkts": 0, "up": 0, "down": 0, "active": False, "last": f["last"],
-            "bypass": bypass.get(f["dev"], []), "threats": 0})
+            "bypass": bypass.get(f["dev"], []), "threats": 0,
+            "agent": "", "ipv6": 0})
         dv["dests"].add(f["rem"])
         dv["pkts"] += f["pkts"]
         dv["up"] += f["up"]
@@ -2030,14 +2709,20 @@ def snapshot():
             flagged_ips.add(d["ip"])
         d["devices"] = sorted(d["devices"])
         d["ports"] = sorted(d["ports"])[:8]
+        d["procs"] = sorted(d["procs"])[:4]
         d["ndev"] = len(d["devices"])
         d["age"] = round(now - d["last"], 1)
         dest_list.append(d)
     dest_list.sort(key=lambda d: (-(d["threat"] is not None), -d["active"],
                                   -(d["up"] + d["down"])))
 
+    agent_by_ip = {a["ip"]: a for a in agents}
+    v6_by_dev = {v["dev"]: v for v in ipv6_raw}
     dev_list = []
     for dv in devices.values():
+        ag = agent_by_ip.get(dv["ip"])
+        dv["agent"] = (ag or {}).get("host", "") or ("yes" if ag else "")
+        dv["ipv6"] = (v6_by_dev.get(dv["ip"]) or {}).get("count", 0)
         dv["ndest"] = len(dv["dests"])
         dv["dests"] = sorted(dv["dests"])
         dv["age"] = round(now - dv["last"], 1)
@@ -2101,12 +2786,15 @@ def snapshot():
         "stats": {"active": active_flows, "devices": len(dev_list),
                   "dests": len(dest_list), "countries": len(countries),
                   "flagged": flagged, "alerts": len(alerts),
-                  "inbound": len(inbound),
+                  "inbound": len(inbound), "ipv6": len(ipv6_raw),
+                  "agents": len(agents), "notes": len(notes_map),
                   "event_retain_h": round(EVENT_RETAIN / 3600.0, 1)},
         "alerts": alerts,
         "devices": dev_list, "dests": dest_list, "inbound": inbound,
         "flagged_events": flagged_events,
         "top_devices": top_devices, "top_dests": top_dests,
+        "ipv6": sorted(ipv6_raw, key=lambda v: -v["last"]),
+        "agents": sorted(agents, key=lambda a: a["ip"]),
     }
 
 
@@ -2149,6 +2837,7 @@ def snapshot_worker():
         try:
             _beat("snapshot")
             _prune(time.time())     # backstop: clears stale flows regardless of capture
+            _prune_procs(time.time())
             SNAP_CACHE["bytes"] = json.dumps(snapshot()).encode("utf-8")
             SNAP_CACHE["ts"] = time.time()
         except Exception:
@@ -2204,6 +2893,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _read_json(self, limit=512 * 1024):
+        """Read a bounded JSON request body. Returns None on anything wrong —
+        callers treat that as a 400 rather than trusting a partial parse."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if n <= 0 or n > limit:
+            return None
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8", "replace"))
+        except Exception:
+            return None
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if not self._host_ok():
             self._deny(); return
@@ -2245,6 +2957,15 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/dns":                 # instant cumulative DNS blocklist
             body = json.dumps({"dns_targets": dns_blocklist()}).encode("utf-8")
             ctype = "application/json"
+        elif u.path == "/viz":                 # visualizations panel aggregates
+            q = parse_qs(u.query)
+            try:
+                hours = max(1, min(24 * RETAIN_DAYS,
+                                   int(float(q.get("hours", ["24"])[0]))))
+            except ValueError:
+                hours = 24
+            body = json.dumps(viz_data(hours)).encode("utf-8")
+            ctype = "application/json"
         else:
             self.send_response(404); self.end_headers(); return
         self.send_response(200)
@@ -2257,6 +2978,47 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._host_ok() or not self._csrf_ok():
             self._deny(); return
+        if self.path == "/agent":
+            # Process attribution from a per-PC agent. Off unless an agent_token
+            # is configured, so an un-configured NetWatch accepts nothing.
+            token = str(CONF.get("agent_token") or "")
+            if not token:
+                self._json({"ok": False, "error": "agent_token not configured"}, 403)
+                return
+            sent = str(self.headers.get("X-NetWatch-Token") or "")
+            if not hmac.compare_digest(sent, token):
+                self._json({"ok": False, "error": "bad token"}, 403)
+                return
+            payload = self._read_json()
+            if not isinstance(payload, dict):
+                self._json({"ok": False, "error": "bad body"}, 400)
+                return
+            dev = self.client_address[0]
+            try:                        # only a LAN peer can describe a LAN device
+                addr = ipaddress.ip_address(dev)
+                if not (is_private_lan(addr) or addr.is_loopback):
+                    self._json({"ok": False, "error": "not a LAN client"}, 403)
+                    return
+            except ValueError:
+                self._deny(400); return
+            n = agent_ingest(dev, payload)
+            self._json({"ok": True, "accepted": n, "dev": dev})
+            return
+        if self.path == "/note":
+            payload = self._read_json(8192)
+            if not isinstance(payload, dict):
+                self._json({"ok": False, "error": "bad body"}, 400)
+                return
+            try:
+                text = save_note(payload.get("key", ""), payload.get("note", ""))
+            except ValueError:
+                self._json({"ok": False, "error": "bad key"}, 400)
+                return
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}, 500)
+                return
+            self._json({"ok": True, "note": text})
+            return
         if self.path == "/quit":
             body = b'{"ok":true}'
             self.send_response(200)
@@ -2474,9 +3236,75 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .dg-hero small{color:var(--text-muted);font-size:12px}
   .dg-stats{display:flex;justify-content:space-around;padding:10px 8px;border-bottom:1px solid var(--border);text-align:center}
   .dg-stats div b{display:block;font-size:16px} .dg-stats div small{color:var(--text-muted);font-size:10px;text-transform:uppercase}
-  #digestBtn{align-self:center;background:var(--surface-3);border:1px solid var(--border);
+  #digestBtn,#vizBtn{align-self:center;background:var(--surface-3);border:1px solid var(--border);
     color:var(--text-secondary);border-radius:8px;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}
-  #digestBtn:hover{border-color:var(--series-1);color:var(--text-primary)}
+  #digestBtn:hover,#vizBtn:hover{border-color:var(--series-1);color:var(--text-primary)}
+  /* visualizations panel */
+  #viz{position:absolute;top:0;right:0;width:620px;max-width:96vw;height:100%;z-index:1600;
+    background:var(--surface-2);border-left:1px solid var(--border);
+    transform:translateX(102%);transition:transform .18s ease;display:flex;flex-direction:column}
+  #viz.open{transform:none}
+  #viz .hd{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;
+    border-bottom:1px solid var(--border);font-weight:600}
+  #viz .hd button{background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer}
+  .vseg{display:flex;gap:2px;padding:8px 12px;border-bottom:1px solid var(--border)}
+  .vseg button{flex:1;background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
+    border-radius:6px;padding:5px 4px;font:inherit;font-size:11px;cursor:pointer}
+  .vseg button.on{background:#20303f;border-color:var(--series-1);color:var(--text-primary)}
+  .vwin{display:flex;gap:8px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--border);
+    font-size:11px;color:var(--text-muted)}
+  .vwin select{background:var(--surface-3);color:var(--text-secondary);border:1px solid var(--border);
+    border-radius:6px;padding:3px 6px;font:inherit;font-size:11px}
+  #vizBody{overflow-y:auto;flex:1;padding:10px 12px 40px}
+  #vizBody h4{margin:2px 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--text-muted);font-weight:600}
+  #vizBody .vnote{color:var(--text-muted);font-size:11px;margin:8px 2px 12px;line-height:1.5}
+  .vlegend{display:flex;flex-wrap:wrap;gap:6px 14px;margin:8px 0 4px;font-size:11px;
+    color:var(--text-secondary)}
+  .vlegend span{display:inline-flex;align-items:center;gap:5px}
+  .vlegend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+  .vempty{color:var(--text-muted);text-align:center;padding:34px 10px;font-size:12px}
+  svg.vchart{width:100%;display:block;overflow:visible}
+  svg.vchart text{fill:var(--text-secondary);font:11px "Segoe UI",system-ui,sans-serif;
+    paint-order:stroke;stroke:var(--surface-2);stroke-width:3px;stroke-linejoin:round}
+  svg.vchart text.mut{fill:var(--text-muted);font-size:10px}
+  svg.vchart .grid{stroke:var(--border);stroke-width:1}
+  svg.vchart .hit{cursor:pointer}
+  .vtable{width:100%;border-collapse:collapse;font-size:11px;margin-top:6px}
+  .vtable th{text-align:left;color:var(--text-muted);font-weight:600;text-transform:uppercase;
+    font-size:10px;letter-spacing:.05em;padding:4px 6px;border-bottom:1px solid var(--border)}
+  .vtable td{padding:4px 6px;border-bottom:1px solid #262623;vertical-align:top}
+  .vtable td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .fpcard{border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:8px;
+    background:var(--surface-1)}
+  .fpcard .fh{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .fpcard .fh b{font-size:12px} .fpcard .fh small{color:var(--text-muted);font-size:10px}
+  .fpstrip{display:flex;gap:2px;margin:7px 0 5px}
+  .fpstrip i{flex:1;height:13px;border-radius:2px;background:var(--surface-3);display:block}
+  .fpstrip i.on{background:var(--series-1)}
+  .fpstrip i.now{outline:2px solid var(--warn);outline-offset:1px}
+  .fpmeta{color:var(--text-muted);font-size:10.5px;line-height:1.6}
+  .fpmeta code{color:var(--text-secondary);font-size:10.5px}
+  .dv{border-left:3px solid var(--warn);padding:6px 10px;margin-bottom:6px;background:var(--surface-1);
+    border-radius:0 6px 6px 0}
+  .dv b{font-size:11.5px} .dv small{display:block;color:var(--text-muted);font-size:10.5px;margin-top:2px}
+  .dv.volume{border-left-color:var(--bad)}
+  .dt-note{padding:10px 14px;border-bottom:1px solid var(--border)}
+  .dt-note label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--text-muted);margin-bottom:6px}
+  .dt-noterow{display:flex;gap:6px}
+  .dt-note input{flex:1;padding:6px 9px;border-radius:6px;border:1px solid var(--border);
+    background:var(--surface-1);color:var(--text-primary);font:inherit;outline:none}
+  .dt-note input:focus{border-color:var(--series-1)}
+  .dt-note button{background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
+    border-radius:6px;padding:6px 12px;font:inherit;font-size:11px;cursor:pointer}
+  .dt-note button:hover{border-color:var(--series-1);color:var(--text-primary)}
+  .dt-note small{display:block;color:var(--text-muted);font-size:10.5px;margin-top:5px;min-height:13px}
+  .noteline{color:var(--text-secondary);font-size:11px;margin-top:2px;font-style:italic}
+  .procline{color:var(--text-muted);font-size:11px;margin-top:2px}
+  .row.noted{border-left:3px solid var(--good)}
+  .badge2.v6{background:#3a2f52;color:#c9bdf0}
+  .badge2.agent{background:#1f3a2c;color:#8fd6ab}
   .al{padding:9px 14px;border-bottom:1px solid #262623;border-left:3px solid var(--text-muted)}
   .al.critical{border-left-color:var(--bad)} .al.warning{border-left-color:var(--warn)}
   .al.notice{border-left-color:var(--series-1)} .al.info{border-left-color:var(--text-muted)}
@@ -2527,7 +3355,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .tile b{font-size:14px}
     .tile small{font-size:9px;letter-spacing:0;white-space:nowrap}
     #digestBtn,#alertBtn,#quitBtn{padding:5px 8px}
-    #detail,#alerts,#digest{width:100%;max-width:100%}
+    #detail,#alerts,#digest,#viz{width:100%;max-width:100%}
     #banner{top:auto;bottom:12px}
   }
 </style>
@@ -2550,6 +3378,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="tile inbound jump" id="tileInbound"
         title="Unsolicited inbound sources seen recently — click to jump to the list">
         <b id="tInbound">–</b><small>inbound</small></div>
+      <button id="vizBtn" title="Constellation, flow, weather and device fingerprints">&#9680; views</button>
       <button id="digestBtn" title="Show a summary">&#9776; digest</button>
       <button id="alertBtn" title="Show alerts">&#9873; alerts<span class="n" id="alertN" style="display:none">0</span></button>
       <button id="quitBtn" title="Stop NetWatch">&#10005; quit</button>
@@ -2584,6 +3413,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button data-view="dns">DNS list</button>
   </div>
   <div id="digestBody"><div class="empty">Loading&hellip;</div></div>
+</div>
+<div id="viz">
+  <div class="hd"><span>Visualizations</span><button id="vizClose">&times;</button></div>
+  <div class="vseg">
+    <button data-view="constellation" class="on">Constellation</button>
+    <button data-view="flow">Flow</button>
+    <button data-view="weather">Weather</button>
+    <button data-view="fingerprint">Fingerprint</button>
+  </div>
+  <div class="vwin"><label for="vizHours">window</label>
+    <select id="vizHours">
+      <option value="1">1 hour</option>
+      <option value="6">6 hours</option>
+      <option value="24" selected>24 hours</option>
+      <option value="168">7 days</option>
+      <option value="720">30 days</option>
+    </select>
+    <span id="vizStamp"></span></div>
+  <div id="vizBody"><div class="vempty">Loading&hellip;</div></div>
 </div>
 <div id="detail">
   <div class="hd"><span class="t" id="detailTitle">Details</span>
@@ -2652,6 +3500,11 @@ function dotIcon(extra,size,color){
     html:'<div class="nm-dot '+extra+'"><span class="ring" '+rst+'></span><span class="core" '+st+'></span></div>'});}
 function devLabel(ip){const n=(latest&&latest.devices||[]).find(d=>d.ip===ip);
   return n?(n.name||n.vendor||ip):ip;}
+function arcWeight(bytes,bad){
+  // 1px at a handful of bytes up to 7px at ~100 MB, log-scaled.
+  const w=1+Math.log2(1+(bytes||0)/4096)*0.42;
+  return Math.max(bad?2:1,Math.min(w,7));
+}
 function fmtBytes(b){if(!b)return "0 B";
   if(b<1024)return b+" B";if(b<1048576)return (b/1024).toFixed(1)+" KB";
   if(b<1073741824)return (b/1048576).toFixed(1)+" MB";return (b/1073741824).toFixed(2)+" GB";}
@@ -2666,6 +3519,8 @@ function destTip(d){const g=d.geo||{};
     +'<div class="tt-isp">'+flag(g.countryCode)+" "+esc(g.city?g.city+", ":"")+esc(g.country||"")
     +(g.isp?" &middot; "+esc(g.isp):"")+"</div>"
     +'<div class="tt-isp">&#8593; '+fmtBytes(d.up)+" &nbsp; &#8595; "+fmtBytes(d.down)+"</div>"
+    +((d.procs&&d.procs.length)?'<div class="tt-isp">&#9881; '+esc(d.procs.join(", "))+"</div>":"")
+    +(d.note?'<div class="tt-host" style="font-style:italic">&#9998; '+esc(d.note)+"</div>":"")
     +'<div class="tt-dev">'+devs+"</div>";}
 
 function render(d){
@@ -2741,18 +3596,23 @@ function render(d){
         const color=bad?"#d03b3b":(selDev?colorFor(selDev):(x.devices.length===1?colorFor(x.devices[0]):BLUE));
         const cls=(x.active?"active":"")+(bad?" bad":"");
         const size=Math.min(9+Math.log2(1+(x.up+x.down)/500)*2.0,24);
+        // Bandwidth arc: thickness carries volume, so a 900 KB upload no longer
+        // looks identical to a 40-byte keepalive. Log-scaled — a home network
+        // spans several orders of magnitude in a single window.
+        const aw=arcWeight(x.up+x.down,bad);
+        const ao=bad?.85:(x.active?Math.min(.35+Math.log2(1+(x.up+x.down)/20000)*0.08,.75):.16);
         let e=layers.get(x.ip);
         if(!e){
           const marker=L.marker(ll,{icon:dotIcon(cls,size,color),zIndexOffset:bad?800:0}).addTo(map)
             .bindTooltip(destTip(x),{className:"nm",direction:"top",offset:[0,-8],sticky:true});
           let arc=null;
-          if(homeLL) arc=L.polyline(arcPoints(homeLL,ll),{color:color,weight:bad?2:1.4,
-            opacity:bad?.8:(x.active?.55:.16),className:x.active?"nm-arc":"",interactive:false}).addTo(map);
+          if(homeLL) arc=L.polyline(arcPoints(homeLL,ll),{color:color,weight:aw,
+            opacity:ao,className:x.active?"nm-arc":"",interactive:false}).addTo(map);
           e={marker,arc};layers.set(x.ip,e);
         }else{
           e.marker.setIcon(dotIcon(cls,size,color));
           e.marker.setTooltipContent(destTip(x));
-          if(e.arc) e.arc.setStyle({color:color,weight:bad?2:1.4,opacity:bad?.8:(x.active?.55:.16),className:x.active?"nm-arc":""});
+          if(e.arc) e.arc.setStyle({color:color,weight:aw,opacity:ao,className:x.active?"nm-arc":""});
         }
         e.marker.setOpacity(x.active||bad?1:.4);
       }catch(err){/* skip a single problematic marker, keep going */}
@@ -2836,9 +3696,12 @@ function renderList(){
     if(q && !(label+" "+dv.ip).toLowerCase().includes(q)) continue;
     const tb=dv.threats?'<span class="badge2 threat" title="talks to a flagged IP">&#9888;</span>':"";
     const vend=(!dv.name&&dv.vendor)?'<span class="vendor">('+esc(dv.vendor)+")</span>":"";
+    // IPv6 is meant to be off on this network, so seeing any is worth a badge.
+    const v6=dv.ipv6?'<span class="badge2 v6" title="talking over IPv6 — IPv6 should be disabled">IPv6</span>':"";
+    const ag=dv.agent?'<span class="badge2 agent" title="process names reported by an agent on this machine">&#9881;</span>':"";
     drows.push('<div class="row'+(dv.active?"":" off")+(dv.threats?" flag":"")+(selDev===dv.ip?" sel":"")
       +'" data-dev="'+esc(dv.ip)+'"><div class="top"><div class="nm">'
-      +'<span class="sw" style="background:'+colorFor(dv.ip)+'"></span>'+esc(label)+" "+vend+" "+tb+bypassBadges(dv)+"</div>"
+      +'<span class="sw" style="background:'+colorFor(dv.ip)+'"></span>'+esc(label)+" "+vend+" "+tb+v6+ag+bypassBadges(dv)+"</div>"
       +'<div class="cnt">'+dv.ndest+" dest"+(dv.ndest===1?"":"s")+"</div></div>"
       +'<div class="ipline">'+esc(dv.ip)+'</div>'
       +'<div class="bytes">&#8593; '+fmtBytes(dv.up)+" &nbsp; &#8595; "+fmtBytes(dv.down)+"</div></div>");
@@ -2852,13 +3715,21 @@ function renderList(){
     if(!x.geo && q) continue;
     const g=x.geo||{};
     if(selDev && !x.devices.includes(selDev)) continue;
-    const hay=(x.ip+" "+(x.host||"")+" "+(g.country||"")+" "+(g.city||"")+" "+(g.isp||"")).toLowerCase();
+    const hay=(x.ip+" "+(x.host||"")+" "+(g.country||"")+" "+(g.city||"")+" "+(g.isp||"")
+      +" "+(x.note||"")+" "+((x.procs||[]).join(" "))).toLowerCase();
     if(q && !hay.includes(q)) continue;
     const tb=x.threat?'<span class="badge2 threat">&#9888; flagged</span> ':"";
-    rrows.push('<div class="row'+(x.active?"":" off")+(x.threat?" flag":"")+'" data-dest="'+esc(x.ip)+'">'
+    // A note is the user's own verdict on this destination, so it outranks
+    // anything we inferred — show it right under the name.
+    const nb=x.note?'<div class="noteline">&#9998; '+esc(x.note)+"</div>":"";
+    const pb=(x.procs&&x.procs.length)
+      ?'<div class="procline">&#9881; '+esc(x.procs.join(", "))+"</div>":"";
+    rrows.push('<div class="row'+(x.active?"":" off")+(x.threat?" flag":"")
+      +(x.note?" noted":"")+'" data-dest="'+esc(x.ip)+'">'
       +'<div class="top"><div class="nm">'+tb+esc(x.host||g.country||x.ip)
       +'<span class="info" data-ip="'+esc(x.ip)+'" title="What is this?">&#9432;</span></div>'
       +'<div class="cnt">'+x.ndev+" dev"+(x.ndev===1?"":"s")+"</div></div>"
+      +nb+pb
       +'<div class="loc">'+flag(g.countryCode)+" "+esc(g.city?g.city+", ":"")
       +(g.country?esc(g.country):"locating&hellip;")+(g.isp?' &middot; <span style="color:var(--text-muted)">'+esc(g.isp)+"</span>":"")+"</div>"
       +'<div class="ipline">'+esc(x.ip)+'</div>'
@@ -3137,6 +4008,348 @@ document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",
   else { digestDays=+b.dataset.days; loadDigest(); }
 }));
 
+// ---- Visualizations panel --------------------------------------------------
+// Four questions asked of the same window. Device colour is the SAME colour the
+// device has on the map (colorFor), so identity carries across every view — a
+// filter or a re-sort never repaints a device.
+const vizPanel=document.getElementById("viz");
+let vizView="constellation", vizHours=24, vizData=null, vizBusy=false;
+
+// sequential ramp: one hue (the series-1 blue), dim -> bright against the dark
+// surface. Magnitude is lightness, never a second hue.
+const RAMP=["#22303f","#243f5c","#27507b","#2a6199","#2f74bd","#3987e5","#69a6ef","#a3ccf7"];
+function rampFor(v,max){
+  if(!max||v<=0)return "#1f2a33";
+  const t=Math.log2(1+v)/Math.log2(1+max);
+  return RAMP[Math.max(0,Math.min(RAMP.length-1,Math.round(t*(RAMP.length-1))))];
+}
+function shortLabel(s,n){s=String(s||"");return s.length>n?s.slice(0,n-1)+"…":s;}
+function hourLabel(ts){const d=new Date(ts*1000);
+  return String(d.getHours()).padStart(2,"0")+":00";}
+function dayLabel(ts){const d=new Date(ts*1000);
+  return (d.getMonth()+1)+"/"+d.getDate();}
+
+async function loadViz(){
+  if(vizBusy)return; vizBusy=true;
+  const body=document.getElementById("vizBody");
+  if(!vizData)body.innerHTML='<div class="vempty">Loading&hellip;</div>';
+  try{
+    const r=await fetch("/viz?hours="+vizHours,{cache:"no-store"});
+    vizData=await r.json();
+  }catch(e){ vizData=null; }
+  vizBusy=false;
+  renderViz();
+}
+function renderViz(){
+  const body=document.getElementById("vizBody");
+  const stamp=document.getElementById("vizStamp");
+  if(!vizData){ body.innerHTML='<div class="vempty">Could not load visualization data.</div>'; return; }
+  stamp.textContent=vizData.generated?("updated "+ago(vizData.generated)):"";
+  if(vizView==="constellation")body.innerHTML=vizConstellation(vizData.constellation);
+  else if(vizView==="flow")body.innerHTML=vizFlow(vizData.flow);
+  else if(vizView==="weather")body.innerHTML=vizWeather(vizData.weather);
+  else body.innerHTML=vizFingerprint(vizData.fingerprint);
+  body.querySelectorAll("[data-ip]").forEach(el=>el.addEventListener("click",()=>{
+    const ip=el.getAttribute("data-ip");
+    if(isIP(ip))openDetail(ip,el.getAttribute("data-dev")||null);
+  }));
+}
+
+// --- Constellation: device -> destination, laid out radially so each device
+// owns an angular sector and its destinations fan out inside it.
+function vizConstellation(c){
+  const devs=(c&&c.devices||[]).filter(d=>d.bytes>0);
+  if(!devs.length)return '<div class="vempty">No traffic in this window yet.</div>';
+  const links=c.links||[];
+  const byDev=new Map();
+  for(const l of links){ if(!byDev.has(l.dev))byDev.set(l.dev,[]); byDev.get(l.dev).push(l); }
+  const W=580,H=580,cx=W/2,cy=H/2,r1=86,r2=178;
+  const maxB=Math.max(...links.map(l=>l.bytes),1);
+  const total=devs.reduce((s,d)=>s+Math.max(d.bytes,1),0);
+  let a0=-Math.PI/2, marks="", nodes="", labels="";
+  marks+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r1+'" fill="none" class="grid" stroke-dasharray="2 4"/>';
+  let di=-1;
+  for(const d of devs){
+    di++;
+    const share=Math.max(d.bytes,1)/total;
+    const span=Math.max(share*Math.PI*2,0.34);      // floor so a quiet device is still readable
+    const mid=a0+span/2;
+    const col=colorFor(d.ip);
+    const dx=cx+Math.cos(mid)*r1, dy=cy+Math.sin(mid)*r1;
+    // home -> device spoke
+    marks+='<line x1="'+cx+'" y1="'+cy+'" x2="'+dx.toFixed(1)+'" y2="'+dy.toFixed(1)+
+      '" stroke="'+col+'" stroke-width="1.5" opacity=".45"/>';
+    const ls=(byDev.get(d.ip)||[]).slice(0,8);
+    ls.forEach((l,i)=>{
+      const t=ls.length===1?0.5:(i+0.5)/ls.length;
+      const ang=a0+span*t;
+      const ex=cx+Math.cos(ang)*r2, ey=cy+Math.sin(ang)*r2;
+      const bad=!!l.threat;
+      const w=Math.max(1,Math.min(1+Math.log2(1+l.bytes/1024)*0.42,7));
+      const mx=cx+Math.cos((mid+ang)/2)*((r1+r2)/2);
+      const my=cy+Math.sin((mid+ang)/2)*((r1+r2)/2);
+      marks+='<path d="M'+dx.toFixed(1)+','+dy.toFixed(1)+' Q'+mx.toFixed(1)+','+my.toFixed(1)+
+        ' '+ex.toFixed(1)+','+ey.toFixed(1)+'" fill="none" stroke="'+(bad?"#d03b3b":col)+
+        '" stroke-width="'+w.toFixed(2)+'" opacity="'+(bad?".85":".4")+'"/>';
+      const rad=Math.max(2.6,Math.min(2.6+Math.log2(1+l.bytes/2048)*0.7,8));
+      nodes+='<circle class="hit" data-ip="'+esc(isIP(l.node)?l.node:"")+'" data-dev="'+esc(l.dev)+
+        '" cx="'+ex.toFixed(1)+'" cy="'+ey.toFixed(1)+'" r="'+rad.toFixed(1)+'" fill="'+
+        (bad?"#d03b3b":col)+'" stroke="var(--surface-2)" stroke-width="2"><title>'+
+        esc(l.node)+"\n"+esc(fmtBytes(l.bytes))+(l.cc?" · "+esc(l.cc):"")+
+        (bad?"\nON THREAT LIST":"")+'</title></circle>';
+      const deg=ang*180/Math.PI, flip=(deg>90||deg<-90);
+      const lr=rad+5;
+      labels+='<g transform="translate('+ex.toFixed(1)+','+ey.toFixed(1)+') rotate('+
+        (flip?deg+180:deg).toFixed(1)+')"><text class="mut" x="'+(flip?-lr:lr)+
+        '" y="3" text-anchor="'+(flip?"end":"start")+'" style="font-size:9px">'+
+        esc(shortLabel(l.node,15))+"</text></g>";
+    });
+    nodes+='<circle cx="'+dx.toFixed(1)+'" cy="'+dy.toFixed(1)+'" r="6" fill="'+col+
+      '" stroke="var(--surface-2)" stroke-width="2"><title>'+esc(d.name)+"\n"+
+      esc(fmtBytes(d.bytes))+" · "+d.ndest+' destinations</title></circle>';
+    // Direct-label only the four biggest devices: past that the labels crowd
+    // each other in narrow sectors. Every device is still named in the legend
+    // and on hover, so identity is never carried by colour alone.
+    if(di<4){
+      const lr2=r1-16-(di%2)*15;
+      const lx=cx+Math.cos(mid)*lr2, ly=cy+Math.sin(mid)*lr2;
+      labels+='<text x="'+lx.toFixed(1)+'" y="'+ly.toFixed(1)+
+        '" text-anchor="middle" style="font-size:10px;font-weight:600">'+
+        esc(shortLabel(d.name,14))+"</text>";
+    }
+    a0+=span;
+  }
+  // The white dot is home; it gets no text label because device labels sit just
+  // inside the ring and a centre label collides with whichever one points at it.
+  nodes+='<circle cx="'+cx+'" cy="'+cy+'" r="7" fill="var(--home)"><title>your LAN</title></circle>';
+  const legend=devs.map(d=>'<span><i style="background:'+colorFor(d.ip)+'"></i>'+
+    esc(shortLabel(d.name,18))+"</span>").join("");
+  return "<h4>Who talks to whom</h4>"+
+    '<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Device to destination link graph">'+
+    marks+nodes+labels+"</svg>"+
+    '<div class="vlegend">'+legend+"</div>"+
+    '<div class="vnote">Each spoke is a device; the dots around it are the destinations it '+
+    "reached. Line thickness and dot size are data volume. Red marks a destination on a "+
+    "threat list. Click a dot to open its details.</div>";
+}
+
+// --- Flow: a two-column Sankey of bytes, device -> country.
+function vizFlow(f){
+  const devs=(f&&f.devices||[]).filter(d=>d.bytes>0);
+  const ccs=(f&&f.countries||[]).filter(c=>c.bytes>0);
+  const links=(f&&f.links||[]).filter(l=>l.bytes>0);
+  if(!devs.length||!ccs.length)return '<div class="vempty">No traffic in this window yet.</div>';
+  const W=580,pad=8,barW=13,leftX=118,rightX=W-118-barW;
+  const rows=Math.max(devs.length,ccs.length);
+  const H=Math.max(220,rows*34);
+  const totalL=devs.reduce((s,d)=>s+d.bytes,0)||1;
+  const totalR=ccs.reduce((s,c)=>s+c.bytes,0)||1;
+  const availL=H-pad*(devs.length-1), availR=H-pad*(ccs.length-1);
+  const pos={},cpos={};
+  let y=0;
+  for(const d of devs){ const h=Math.max(6,d.bytes/totalL*availL); pos[d.ip]={y:y,h:h,cur:y}; y+=h+pad; }
+  y=0;
+  for(const c of ccs){ const h=Math.max(6,c.bytes/totalR*availR); cpos[c.name]={y:y,h:h,cur:y}; y+=h+pad; }
+  let bars="",ribs="",labels="";
+  for(const d of devs){
+    const p=pos[d.ip],col=d.ip==="other"?"#6f6f68":colorFor(d.ip);
+    bars+='<rect x="'+leftX+'" y="'+p.y.toFixed(1)+'" width="'+barW+'" height="'+p.h.toFixed(1)+
+      '" rx="3" fill="'+col+'"><title>'+esc(d.name)+"\n"+esc(fmtBytes(d.bytes))+"</title></rect>";
+    labels+='<text x="'+(leftX-8)+'" y="'+(p.y+p.h/2+3.5).toFixed(1)+'" text-anchor="end">'+
+      esc(shortLabel(d.name,16))+"</text>";
+  }
+  for(const c of ccs){
+    const p=cpos[c.name];
+    bars+='<rect x="'+rightX+'" y="'+p.y.toFixed(1)+'" width="'+barW+'" height="'+p.h.toFixed(1)+
+      '" rx="3" fill="#6f6f68"><title>'+esc(c.name)+"\n"+esc(fmtBytes(c.bytes))+"</title></rect>";
+    labels+='<text x="'+(rightX+barW+8)+'" y="'+(p.y+p.h/2+3.5).toFixed(1)+'">'+
+      esc(shortLabel(c.name,16))+"</text>";
+  }
+  const x0=leftX+barW,x1=rightX,mx=(x0+x1)/2;
+  for(const l of links.slice(0,60)){
+    const p=pos[l.dev],q=cpos[l.country];
+    if(!p||!q)continue;
+    const hL=Math.max(1.2,l.bytes/totalL*availL), hR=Math.max(1.2,l.bytes/totalR*availR);
+    const y0=p.cur,y1=q.cur; p.cur+=hL; q.cur+=hR;
+    const col=l.dev==="other"?"#6f6f68":colorFor(l.dev);
+    ribs+='<path d="M'+x0+','+y0.toFixed(1)+' C'+mx+','+y0.toFixed(1)+' '+mx+','+y1.toFixed(1)+
+      ' '+x1+','+y1.toFixed(1)+' L'+x1+','+(y1+hR).toFixed(1)+' C'+mx+','+(y1+hR).toFixed(1)+
+      ' '+mx+','+(y0+hL).toFixed(1)+' '+x0+','+(y0+hL).toFixed(1)+' Z" fill="'+col+
+      '" opacity=".34"><title>'+esc(l.dev==="other"?"other devices":devLabel(l.dev))+
+      " → "+esc(l.country)+"\n"+esc(fmtBytes(l.bytes))+"</title></path>";
+  }
+  const legend=devs.map(d=>'<span><i style="background:'+(d.ip==="other"?"#6f6f68":colorFor(d.ip))+
+    '"></i>'+esc(shortLabel(d.name,18))+"</span>").join("");
+  return "<h4>Where the bytes go</h4>"+
+    '<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Device to country bandwidth flow">'+
+    ribs+bars+labels+"</svg>"+
+    '<div class="vlegend">'+legend+"</div>"+
+    '<div class="vnote">Band thickness is total bytes moved in this window. Devices on the '+
+    "left, destination countries on the right.</div>";
+}
+
+// --- Weather: activity over time. Short windows get bars; long windows get a
+// day x hour heatmap, which is where a routine (or a break in one) shows up.
+function vizWeather(w){
+  const b=(w&&w.buckets||[]);
+  if(!b.length)return '<div class="vempty">No history in this window yet.</div>';
+  const peak=Math.max(...b.map(x=>x.bytes),1);
+  let html="<h4>When the network is busy</h4>";
+  if(b.length<=48){
+    const W=580,H=170,padL=52,padB=26,padT=8;
+    const n=b.length,bw=(W-padL-8)/n;
+    let bars="",axis="";
+    b.forEach((x,i)=>{
+      const h=x.bytes>0?Math.max(2,(H-padB-padT)*(Math.log2(1+x.bytes)/Math.log2(1+peak))):0;
+      const bx=padL+i*bw, by=H-padB-h;
+      bars+='<rect x="'+(bx+1).toFixed(1)+'" y="'+by.toFixed(1)+'" width="'+Math.max(1,bw-2).toFixed(1)+
+        '" height="'+h.toFixed(1)+'" rx="'+Math.min(4,bw/3).toFixed(1)+'" fill="'+rampFor(x.bytes,peak)+
+        '"><title>'+esc(hourLabel(x.ts))+"\n"+esc(fmtBytes(x.bytes))+"\n"+x.devices+
+        " devices · "+x.dests+" destinations"+(x.alerts?"\n"+x.alerts+" alerts":"")+"</title></rect>";
+      if(n<=12||i%Math.ceil(n/12)===0)
+        axis+='<text class="mut" x="'+(bx+bw/2).toFixed(1)+'" y="'+(H-padB+13)+
+          '" text-anchor="middle">'+esc(hourLabel(x.ts))+"</text>";
+    });
+    html+='<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Bytes per hour">'+
+      '<line class="grid" x1="'+padL+'" y1="'+(H-padB)+'" x2="'+(W-8)+'" y2="'+(H-padB)+'"/>'+
+      '<text class="mut" x="'+(padL-8)+'" y="'+(padT+9)+'" text-anchor="end">'+esc(fmtBytes(peak))+"</text>"+
+      '<text class="mut" x="'+(padL-8)+'" y="'+(H-padB)+'" text-anchor="end">0</text>'+
+      bars+axis+"</svg>";
+  }else{
+    // day x hour heatmap
+    const days=[];
+    const byDay=new Map();
+    for(const x of b){
+      const d=new Date(x.ts*1000), key=d.getFullYear()+"-"+d.getMonth()+"-"+d.getDate();
+      if(!byDay.has(key)){ byDay.set(key,{ts:x.ts,cells:new Array(24).fill(null)}); days.push(key); }
+      byDay.get(key).cells[d.getHours()]=x;
+    }
+    const W=580,padL=48,cell=(W-padL-8)/24,rowH=15;
+    const H=days.length*rowH+34;
+    let cells="",axis="";
+    days.forEach((k,r)=>{
+      const row=byDay.get(k);
+      cells+='<text class="mut" x="'+(padL-8)+'" y="'+(28+r*rowH+11)+'" text-anchor="end">'+
+        esc(dayLabel(row.ts))+"</text>";
+      for(let h=0;h<24;h++){
+        const x=row.cells[h];
+        cells+='<rect x="'+(padL+h*cell+1).toFixed(1)+'" y="'+(28+r*rowH+1)+'" width="'+
+          Math.max(1,cell-2).toFixed(1)+'" height="'+(rowH-2)+'" rx="2" fill="'+
+          (x?rampFor(x.bytes,peak):"#1f2a33")+'"><title>'+esc(dayLabel(row.ts))+" "+
+          String(h).padStart(2,"0")+":00\n"+(x?esc(fmtBytes(x.bytes))+"\n"+x.devices+
+          " devices · "+x.dests+" destinations":"no data")+"</title></rect>";
+      }
+    });
+    for(let h=0;h<24;h+=3)
+      axis+='<text class="mut" x="'+(padL+h*cell+cell/2).toFixed(1)+'" y="20" text-anchor="middle">'+
+        String(h).padStart(2,"0")+"</text>";
+    html+='<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Activity heatmap by day and hour">'+
+      axis+cells+"</svg>";
+    const steps=RAMP.map((c,i)=>'<span><i style="background:'+c+'"></i>'+
+      (i===0?"quiet":(i===RAMP.length-1?fmtBytes(peak):""))+"</span>").join("");
+    html+='<div class="vlegend">'+steps+"</div>";
+  }
+  // Alerts get their own chart rather than a second y-axis on the one above.
+  // In heatmap mode the hour columns no longer map to a linear x, so the alert
+  // bars are aggregated per day to match what is actually on screen.
+  if(b.some(x=>x.alerts>0)){
+    const daily=b.length>48;
+    let series;
+    if(daily){
+      const m=new Map();
+      for(const x of b){
+        const d=new Date(x.ts*1000), k=d.getFullYear()+"-"+d.getMonth()+"-"+d.getDate();
+        if(!m.has(k))m.set(k,{ts:x.ts,alerts:0});
+        m.get(k).alerts+=x.alerts;
+      }
+      series=[...m.values()];
+    }else series=b.map(x=>({ts:x.ts,alerts:x.alerts}));
+    const maxA=Math.max(...series.map(x=>x.alerts),1);
+    const W=580,H=58,padL=52,padB=16,n=series.length,bw=(W-padL-8)/n;
+    let ab="",ax="";
+    series.forEach((x,i)=>{
+      if(!x.alerts)return;
+      const h=Math.max(3,(H-padB-6)*(x.alerts/maxA));
+      ab+='<rect x="'+(padL+i*bw+1).toFixed(1)+'" y="'+(H-padB-h).toFixed(1)+'" width="'+
+        Math.max(1.5,bw-2).toFixed(1)+'" height="'+h.toFixed(1)+'" rx="2" fill="var(--warn)"><title>'+
+        esc(daily?dayLabel(x.ts):hourLabel(x.ts))+"\n"+x.alerts+" alerts</title></rect>";
+    });
+    const step=Math.max(1,Math.ceil(n/8));
+    series.forEach((x,i)=>{
+      if(i%step)return;
+      ax+='<text class="mut" x="'+(padL+i*bw+bw/2).toFixed(1)+'" y="'+(H-3)+
+        '" text-anchor="middle">'+esc(daily?dayLabel(x.ts):hourLabel(x.ts))+"</text>";
+    });
+    html+='<h4 style="margin-top:14px">Alerts '+(daily?"per day":"per hour")+"</h4>"+
+      '<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Alerts over time">'+
+      '<line class="grid" x1="'+padL+'" y1="'+(H-padB)+'" x2="'+(W-8)+'" y2="'+(H-padB)+'"/>'+
+      '<text class="mut" x="'+(padL-8)+'" y="14" text-anchor="end">'+maxA+"</text>"+ab+ax+"</svg>";
+  }
+  const filled=b.filter(x=>x.bytes>0).length;
+  if(filled<3)
+    html+='<div class="vnote">Only '+filled+" hour"+(filled===1?"":"s")+
+      " of history so far — this view gets useful once NetWatch has been running "+
+      "for a day or so.</div>";
+  return html+'<div class="vnote">Colour is the volume moved in that hour. A device with a '+
+    "routine makes a visible pattern here — the useful part is when the pattern breaks.</div>";
+}
+
+// --- Fingerprint: what normal looks like for each device, and what broke it.
+function vizFingerprint(fp){
+  const devs=(fp&&fp.devices||[]);
+  const devi=(fp&&fp.deviations||[]);
+  if(!devs.length)
+    return '<div class="vempty">No profiles learned yet.<br><br>NetWatch needs about a day of '+
+      "history per device before it can say what is normal for it.</div>";
+  let html="";
+  if(devi.length){
+    html+="<h4>Recent deviations</h4>";
+    for(const d of devi.slice(0,12))
+      html+='<div class="dv '+esc(d.kind)+'"><b>'+esc(d.name||d.dev)+"</b> "+esc(d.detail)+
+        "<small>"+esc(ago(d.ts))+"</small></div>";
+  }
+  html+='<h4 style="margin-top:14px">Learned profiles</h4>';
+  const nowH=new Date().getHours();
+  for(const d of devs.slice(0,20)){
+    const hod=(d.hod||"").padEnd(24,"0");
+    let strip="";
+    for(let h=0;h<24;h++)
+      strip+='<i class="'+(hod[h]==="1"?"on":"")+(h===nowH?" now":"")+'" title="'+
+        String(h).padStart(2,"0")+":00 "+(hod[h]==="1"?"normally active":"never active")+'"></i>';
+    const ports=(d.ports||[]).slice(0,12).join(", ")||"none recorded";
+    const state=d.mature?(d.hours+" h learned"):("learning · "+d.hours+" h of 24");
+    html+='<div class="fpcard"><div class="fh"><b>'+esc(d.name)+"</b><small>"+
+      esc(state)+"</small></div>"+
+      '<div class="fpstrip">'+strip+"</div>"+
+      '<div class="fpmeta">'+(d.mature
+        ?("busiest hour <code>"+esc(fmtBytes(d.max_bytes))+"</code> · typical <code>"+
+          esc(fmtBytes(Math.round(d.avg_bytes)))+"</code> · widest hour <code>"+
+          d.max_dests+" destinations</code>")
+        :"<code>no baseline yet</code> — needs a full hour of history before "+
+         "there is anything to compare against")+"<br>"+
+      "ports <code>"+esc(ports)+(d.nports>12?" (+"+(d.nports-12)+" more)":"")+"</code><br>"+
+      "this hour <code>"+esc(fmtBytes(d.cur_bytes))+" · "+d.cur_dests+
+      " destinations</code></div></div>";
+  }
+  return html+'<div class="vnote">The strip is the hours of the day this device is normally '+
+    "awake (the outlined cell is the hour now). Deviations fire once a device has enough "+
+    "history to have a normal at all.</div>";
+}
+
+document.getElementById("vizBtn").addEventListener("click",()=>{
+  const opening=!vizPanel.classList.contains("open");
+  vizPanel.classList.toggle("open");
+  if(opening)loadViz();
+});
+document.getElementById("vizClose").addEventListener("click",()=>vizPanel.classList.remove("open"));
+document.querySelectorAll(".vseg button").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".vseg button").forEach(x=>x.classList.toggle("on",x===b));
+  vizView=b.dataset.view; renderViz();
+}));
+document.getElementById("vizHours").addEventListener("change",e=>{
+  vizHours=+e.target.value; vizData=null; loadViz();
+});
+
 // ---- Detail drawer: everything known about one remote IP -------------------
 const detailPanel=document.getElementById("detail");
 let detailIP=null;
@@ -3203,7 +4416,18 @@ function renderDetail(d){
       +fmtBytes(tot.down||0)+"</dd>"
     +(tot.first_seen?"<dt>First seen</dt><dd>"+ago(tot.first_seen)+"</dd>":"")
     +(tot.last_seen?"<dt>Last seen</dt><dd>"+ago(tot.last_seen)+"</dd>":"")
+    +(d.procs&&d.procs.length?"<dt>Process</dt><dd class=\"dt-mono\">"
+      +d.procs.map(esc).join("<br>")+"</dd>":"")
     +"</dl>";
+
+  // Your own note about this destination. Saved to netwatch_notes.json, so it
+  // survives restarts and shows up next to the address everywhere else.
+  h+='<div class="dt-note"><label for="dtNote">Your note on '
+    +esc(d.note_key||d.ip)+"</label>"
+    +'<div class="dt-noterow"><input id="dtNote" type="text" maxlength="200" '
+    +'placeholder="e.g. Syncthing relay — expected" value="'+esc(d.note||"")+'">'
+    +'<button data-act="note">Save</button></div>'
+    +'<small id="dtNoteMsg"></small></div>';
 
   h+='<div class="dt-actions">'
     +(g.lat!==undefined?'<button data-act="map">Show on map</button>':"")
@@ -3278,6 +4502,16 @@ function renderDetail(d){
         e2.marker.openTooltip();}
       else if(map&&d.geo)map.flyTo([d.geo.lat,d.geo.lon],5);
       closeDetail();digestPanel.classList.remove("open");alertsPanel.classList.remove("open");
+    }else if(act==="note"){
+      const inp=document.getElementById("dtNote");
+      const msg=document.getElementById("dtNoteMsg");
+      b.disabled=true; msg.textContent="Saving…";
+      fetch("/note",{method:"POST",headers:{"X-NetWatch":"1","Content-Type":"application/json"},
+        body:JSON.stringify({key:d.note_key||d.ip,note:inp.value})})
+        .then(r=>r.json()).then(j=>{
+          msg.textContent=j.ok?(j.note?"Saved.":"Note cleared."):("Failed: "+(j.error||"error"));
+          b.disabled=false;
+        }).catch(()=>{msg.textContent="Failed to save.";b.disabled=false;});
     }
   }));
 }
@@ -3362,6 +4596,9 @@ def main():
     threading.Thread(target=alert_worker, name="alert", daemon=True).start()
     threading.Thread(target=notify_worker, name="notify", daemon=True).start()
     threading.Thread(target=digest_worker, name="digest", daemon=True).start()
+    threading.Thread(target=notes_worker, name="notes", daemon=True).start()
+    threading.Thread(target=fingerprint_worker, name="fingerprint",
+                     daemon=True).start()
     threading.Thread(target=snapshot_worker, name="snapshot", daemon=True).start()
     threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
 

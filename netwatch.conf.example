@@ -16,6 +16,12 @@
   "event_retain_hours": 6,
   "_event_retain_hours": "How long a security EVENT stays on the header counters and in the side panel after its last sighting. Applies equally to the 'flagged' tile (threat-blocklist hits) and the 'inbound' tile (unsolicited inbound connections) - one window for both, so flagged can never drain faster than inbound. These are events, not live flows: they deliberately outlive the 2-minute flow table, and they are saved to the database so a restart doesn't blank the counters. Raise it if you want a full day of context on screen (24), lower it if you want the tiles to settle down sooner. Clamped to between 5 minutes and 30 days.",
 
+  "alert_ipv6": true,
+  "_alert_ipv6": "If true (default), alert when any device reaches a global IPv6 address. This network is deliberately IPv4-only — the gateway ACLs that force DNS through the Pi-holes and block DoT/DoH are v4 rules — so v6 traffic means either a misconfiguration or a device routing straight around them. Alerts are grouped per /64, so one device chatting to a dozen addresses at one provider produces one alert, not a dozen. Set false if you deliberately run dual-stack.",
+
+  "agent_token": "",
+  "_agent_token": "Shared secret for the optional per-PC agent (netwatch_agent.py), which reports which PROCESS owns each connection on a machine you install it on — something a mirrored port can never see. Leave empty (the default) and the /agent endpoint refuses everything, so an unconfigured NetWatch cannot be fed data by anyone. Set a long random string here and pass the same value to the agent with --token. Only a LAN client can post, the token is compared in constant time, and the agent sends nothing but remote address, port and process name.",
+
   "host_check": true,
   "_host_check": "Anti-DNS-rebinding protection. When true (default), NetWatch only answers requests whose Host header is this LAN box (localhost, a private/link-local IP, a *.local or single-label name, or an entry in allow_hosts). This stops a malicious web page from rebinding a public domain to your Pi and reading your device inventory. Set false only if it blocks a legitimate way you reach the dashboard.",
 

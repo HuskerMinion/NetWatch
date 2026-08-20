@@ -1,0 +1,9 @@
+{
+  "_comment": "Rename to netwatch_notes.json (next to netwatch.py) to annotate DESTINATIONS — the far end of a flow, as opposed to netwatch_names.json which names your own devices. Keys are an exact remote IP, an exact hostname, or a '*.suffix' wildcard covering a domain and everything under it. Values are your note, up to 200 characters. A note shows next to the address everywhere it appears — the destination list, the map tooltip and the detail drawer — so a destination you have already vetted stops looking suspicious every time you glance at it. Lookup order is exact IP, then exact hostname, then the LONGEST matching wildcard. Keys starting with _ and blank values are ignored. Edits take effect within ~5s with no restart, and you can also write notes straight from the dashboard: click the (i) on any destination and use the note box.",
+
+  "203.0.113.44": "Syncthing relay — expected, TCP/QUIC 22000",
+  "tunnel.example-vpn.net": "Work VPN concentrator",
+  "*.tplinkcloud.com": "Omada gateway phoning home — expected",
+  "*.samsungcloudsolution.com": "Living-room TV telemetry — blocked at the Pi-hole, harmless if it retries",
+  "192.0.2.7": "Old NAS backup target, decommissioned — investigate if this reappears"
+}

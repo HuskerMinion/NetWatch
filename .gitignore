@@ -15,3 +15,7 @@ netwatch.conf
 
 # Your device-name map is personal to your network — keep the .example, not this
 netwatch_names.json
+
+# Your destination notes are personal too — keep the .example, not this
+netwatch_notes.json
+netwatch_notes.json.tmp

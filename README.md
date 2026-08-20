@@ -68,7 +68,24 @@ Pi-hole bypass; the alerts feed is severity-coded.*
   alert counts, threat hits, and a **deduplicated list of every DNS server/resolver
   devices tried to reach** — a ready-made blocklist for your firewall or ACLs
 - **History** saved to SQLite with a 24-hour look-back view; 30-day retention
-- **Data volume** (↑ upload / ↓ download) per device and destination
+- **Data volume** (↑ upload / ↓ download) per device and destination, with map arcs
+  weighted by volume so a large transfer never looks like a keepalive
+- **Visualizations panel** — four ways of reading the same window: *Constellation*
+  (which device talks to which destination), *Flow* (a Sankey of bytes by country),
+  *Weather* (activity by hour, or a day × hour heatmap over longer windows), and
+  *Fingerprint* (each device's learned normal)
+- **Device fingerprinting** — NetWatch learns each device's normal hours, ports,
+  hourly volume and destination breadth, then alerts when one deviates. IoT gear is
+  boringly consistent, which is exactly what makes a doorbell suddenly uploading
+  200 MB at 3am to fifty new hosts worth knowing about
+- **Destination notes** — annotate any IP, hostname or `*.domain` with your own
+  verdict ("Syncthing relay — expected"), from the dashboard or a JSON file, so a
+  destination you've already vetted stops looking suspicious
+- **IPv6 leak alerts** — on a network run deliberately IPv4-only, any global v6
+  traffic is a misconfiguration or a device routing around your v4 firewall rules
+- **Process attribution (optional)** — a mirrored port can never see *which program*
+  opened a socket. Run [`netwatch_agent.py`](netwatch_agent.py) on a PC you care
+  about and its flows gain process names, while every other device is unaffected
 - **Pi-hole bypass detection** — flags devices doing their own external DNS,
   DoT (port 853), or DoH; the digest's **DNS list** tab is a cumulative, deduplicated
   blocklist split into firewall-blockable IPs and Pi-hole-blockable domains
@@ -247,6 +264,56 @@ Adding a name applies within a few seconds; removing one needs a restart. If you
 switch or controller can export a client list, you can build this file from that
 export rather than typing names by hand.
 
+### 10. Annotating destinations (optional)
+
+Most of the noise in a network monitor is destinations you have already decided are
+fine. Click the **(i)** on any destination and write a note — it appears next to
+that address everywhere afterwards, including the map tooltip. Notes are stored in
+`netwatch_notes.json`; see
+[`netwatch_notes.json.example`](netwatch_notes.json.example) for the file format,
+which also supports `*.domain` wildcards. Edits either way apply within a few
+seconds without a restart.
+
+### 11. The Visualizations panel
+
+The **views** button in the header opens four readings of the same window
+(1 hour to 30 days):
+
+| View | Answers |
+|---|---|
+| **Constellation** | Who talks to whom. Each spoke is a device, the dots around it are its destinations, thickness and size are volume, red is a threat-list hit. |
+| **Flow** | Where the bytes go — a Sankey from device to destination country. |
+| **Weather** | When the network is busy. Bars per hour on short windows, a day × hour heatmap on long ones, with alerts charted underneath. |
+| **Fingerprint** | What normal looks like per device, and what recently broke it. |
+
+The Fingerprint view needs about a day of history per device before it says
+anything: it builds a baseline from **completed** hours only, then compares the hour
+in progress against it. It alerts on four kinds of deviation — an hourly volume
+spike, a sudden fan-out to many more destinations than usual, activity at an hour
+the device has never been awake (needs a full week first), and a port the device has
+never used. All four are deliberately conservative; a device without enough history
+raises nothing at all.
+
+### 12. Process names for a specific PC (optional)
+
+A mirrored port sees every device but can never see which *program* opened a socket
+— that only exists on the machine itself. To close that gap on machines you care
+about:
+
+1. Set a long random `agent_token` in `netwatch.conf` and restart NetWatch.
+   (While it's empty — the default — the `/agent` endpoint refuses everything.)
+2. Copy `netwatch_agent.py` to the PC and run it:
+
+```bash
+python3 netwatch_agent.py --server 192.168.34.50 --token YOUR-TOKEN
+```
+
+It is pure standard library, opens no listening port, and sends only remote
+address, port and process name — no local traffic, no command lines, no file paths.
+Works on Linux (`/proc`), Windows (`netstat`/`tasklist`, no admin needed) and macOS
+(`lsof`). That machine's destinations then show a ⚙ process name in the list, the
+map tooltip and the detail drawer. Every other device on the network is unaffected.
+
 ---
 
 ## Responsible use
@@ -265,12 +332,15 @@ The dashboard is an **unauthenticated LAN service** — anyone who can reach
 - **Keep it on a trusted LAN.** Don't port-forward it to the internet or expose it
   on an untrusted/guest network. If you need remote access, reach it over a VPN
   (e.g. Tailscale/WireGuard), not a public port.
-- **Built-in protections.** The action endpoints (clear alerts, quit) require a
-  same-origin request header, so a malicious web page a LAN user visits can't fire
-  them cross-site (CSRF). All endpoints also validate the `Host` header to block
-  DNS-rebinding attempts against the read APIs. If you reach the dashboard by a
-  public DNS name, add it to `allow_hosts` in `netwatch.conf`; `host_check` can be
-  turned off there if needed (not recommended).
+- **Built-in protections.** The action endpoints (clear alerts, quit, save note,
+  agent report) require a same-origin request header, so a malicious web page a LAN
+  user visits can't fire them cross-site (CSRF). All endpoints also validate the
+  `Host` header to block DNS-rebinding attempts against the read APIs. If you reach
+  the dashboard by a public DNS name, add it to `allow_hosts` in `netwatch.conf`;
+  `host_check` can be turned off there if needed (not recommended).
+- **The agent endpoint is off until you configure it.** `/agent` refuses every
+  request while `agent_token` is unset. When set, the token is compared in constant
+  time and only a LAN client may post.
 
 ## Tests
 
@@ -283,6 +353,13 @@ Unit tests for the pure parsers/classifier and the DB layer — device-name
 overrides, inbound-record retention, the DNS blocklist (dedup + firewall/Pi-hole
 grouping), digest aggregation, and the bypass-alert cap. No root, network, or
 capture needed; the DB tests run against a throwaway sqlite file.
+
+`tests/test_netwatch_insight.py` covers the analysis layer: destination-note lookup
+precedence (IP → hostname → longest wildcard) and round-tripping through the file,
+agent ingestion (public destinations only, TTL expiry, the memory cap, and the join
+onto the right device), IPv6 leak grouping per /64, the fingerprint engine (nothing
+fires before a device is mature; volume, fan-out and new-port deviations do fire;
+a normal hour stays quiet), the hourly byte-delta rollup, and the `/viz` aggregates.
 
 `tests/test_netwatch_events.py` covers the event model specifically: that a flagged
 hit outlives its flow being dropped, that flagged and inbound expire on the same
