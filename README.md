@@ -274,10 +274,16 @@ that address everywhere afterwards, including the map tooltip. Notes are stored 
 which also supports `*.domain` wildcards. Edits either way apply within a few
 seconds without a restart.
 
-### 11. The Visualizations panel
+### 11. The Visualizations dock
 
-The **views** button in the header opens four readings of the same window
-(1 hour to 30 days):
+Four full-width tabs sit permanently along the bottom edge of the map. Click a
+tab to open that view in a dock above it; click the same tab again to close it.
+The time window, the ▲ (fill the map) and the × appear at the dock's top-right
+once it is open — clear of Leaflet's attribution in the map's bottom-right
+corner. `Esc` steps back down and **V** toggles the dock. The map itself never
+resizes, so toggling is instant and your pan and zoom are preserved.
+
+Four readings of the same window (1 hour to 30 days):
 
 | View | Answers |
 |---|---|
@@ -285,6 +291,11 @@ The **views** button in the header opens four readings of the same window
 | **Flow** | Where the bytes go — a Sankey from device to destination country. |
 | **Weather** | When the network is busy. Bars per hour on short windows, a day × hour heatmap on long ones, with alerts charted underneath. |
 | **Fingerprint** | What normal looks like per device, and what recently broke it. |
+
+Charts are drawn at the container's real pixel size, so they stay legible in the
+short dock and simply gain detail when expanded — the constellation is laid out
+on an ellipse that fills whatever rectangle it's given, becoming circular when
+the view fills the map.
 
 The Fingerprint view needs about a day of history per device before it says
 anything: it builds a baseline from **completed** hours only, then compares the hour
@@ -294,7 +305,29 @@ the device has never been awake (needs a full week first), and a port the device
 never used. All four are deliberately conservative; a device without enough history
 raises nothing at all.
 
-### 12. Process names for a specific PC (optional)
+### 12. Tuning the map's tone
+
+The basemap is **CARTO dark_matter**, drawn as-is. The near-black ground is the
+point: the connection arcs carry device identity, so they are mid-lightness by
+design, and a darker map is what makes them legible. Lighter treatments were
+tried — sepia, a dimmed CARTO Voyager with blue water and grey land — and each
+cost more in arc contrast than it gained in map detail.
+
+If you want to experiment anyway, five variables at the top of the `:root` block
+in `netwatch.py`'s `HTML_PAGE` feed a CSS filter on the tile layer. They ship as
+identity (no change); reload with Ctrl+F5 after editing:
+
+```css
+--map-bright:1; --map-sepia:0; --map-sat:1;
+--map-hue:0deg; --map-contrast:1;
+```
+
+`--map-bright:1.3` lightens the land; `--map-sepia:.6` warms the whole map toward
+brown. Watch the arcs as you go — that is the thing being traded away. The filter
+is scoped to the tile layer, so markers, arcs and tooltips keep their true colours
+whatever you set.
+
+### 13. Process names for a specific PC (optional)
 
 A mirrored port sees every device but can never see which *program* opened a socket
 — that only exists on the machine itself. To close that gap on machines you care

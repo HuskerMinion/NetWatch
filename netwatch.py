@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.20.1"  # date + same-day build number, so successive changes on
+VERSION = "2026.08.20.7"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -3062,36 +3062,95 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
   :root{
     color-scheme:dark;
-    --surface-1:#141413; --surface-2:#1e1e1c; --surface-3:#2a2a27;
-    --border:#3a3a36;
-    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8a897f;
+    /* Dark GREY rather than near-black: enough lift that panels read as
+       surfaces instead of holes, while still sitting behind a bright map. */
+    --surface-1:#212429; --surface-2:#282c32; --surface-3:#343941;
+    --border:#454b55; --border-soft:#333840;
+    --text-primary:#ffffff; --text-secondary:#c7cbd2; --text-muted:#8c919b;
     --series-1:#3987e5; --home:#f4f4ee;
     --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+    --accent:#3987e5; --accent-2:#9085e9;
+    /* ---- basemap tone -------------------------------------------------- */
+    /* CARTO dark_matter, shipped as-drawn. Near-black land is what gives the
+       connection arcs their contrast: the arcs carry device identity, so they
+       are mid-lightness by design, and every attempt to lighten the ground
+       (brown, then grey-blue, then dark grey) cost more in arc legibility than
+       it bought in map detail. The values below are identity — a dial to
+       experiment with, not a treatment:
+         --map-bright  1.3 for a lighter map   --map-sepia .6 for a sepia one
+         --map-sat     raise to bring out what little colour the tiles carry */
+    --map-bright:1; --map-sepia:0; --map-sat:1;
+    --map-hue:0deg; --map-contrast:1;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:var(--surface-1);
     font:13px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif;
     color:var(--text-primary);overflow:hidden}
   #app{display:grid;grid-template-rows:auto 1fr;height:100%}
-  header{display:flex;align-items:center;gap:14px;padding:10px 16px;
-    background:var(--surface-2);border-bottom:1px solid var(--border);flex-wrap:wrap}
-  h1{font-size:15px;margin:0;font-weight:600}
-  h1 span{color:var(--series-1)}
-  .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;
-    border-radius:999px;background:var(--surface-3);color:var(--text-secondary);font-size:11px}
-  .pill .led{width:7px;height:7px;border-radius:50%;background:var(--good)}
-  .pill.warn .led{background:var(--warn)} .pill.bad .led{background:var(--bad)}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;position:relative;
+    background:linear-gradient(180deg,#2e333a,#242830);
+    border-bottom:1px solid var(--border);flex-wrap:wrap;
+    box-shadow:0 1px 0 rgba(255,255,255,.03),0 4px 18px rgba(0,0,0,.35)}
+  /* a thin accent thread under the header, so the chrome reads as deliberate */
+  header::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;
+    background:linear-gradient(90deg,var(--accent),var(--accent-2),transparent 65%);opacity:.55}
+  .brand{display:flex;flex-direction:column}
+  h1{margin:0;line-height:0}
+  .logo{height:38px;width:auto;display:block;overflow:visible}
+  .logo .lblip{animation:nwblip 2.8s ease-in-out infinite}
+  @keyframes nwblip{0%,70%,100%{opacity:1}82%{opacity:.3}}
+  .tag{display:block;font-size:9px;color:var(--text-muted);letter-spacing:.1em;
+    text-transform:uppercase;margin-top:-1px;white-space:nowrap}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;
+    border-radius:999px;background:var(--surface-3);border:1px solid var(--border);
+    color:var(--text-secondary);font-size:11px}
+  .pill .led{width:7px;height:7px;border-radius:50%;background:var(--good);
+    box-shadow:0 0 7px currentColor;color:var(--good)}
+  .pill.warn .led{background:var(--warn);color:var(--warn)}
+  .pill.bad .led{background:var(--bad);color:var(--bad)}
   .pill .badge{background:var(--warn);color:#000;border-radius:4px;padding:0 5px;
     font-weight:600;font-size:10px}
-  .tiles{display:flex;gap:10px;margin-left:auto;flex-wrap:wrap}
-  .tile{background:var(--surface-3);border-radius:8px;padding:5px 12px;text-align:right;min-width:74px}
-  .tile b{display:block;font-size:16px;font-variant-numeric:tabular-nums}
-  .tile small{color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em}
-  #quitBtn{align-self:center;background:var(--surface-3);color:var(--text-secondary);
-    border:1px solid var(--border);border-radius:8px;padding:6px 12px;font:inherit;font-size:11px;cursor:pointer}
+  .tiles{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap;align-items:stretch}
+  .tile{position:relative;background:linear-gradient(180deg,#383d46,#2c3038);
+    border:1px solid var(--border);border-radius:10px;padding:6px 13px 6px 14px;
+    text-align:right;min-width:78px;overflow:hidden;transition:all .16s}
+  /* left edge lights up in the tile's own colour — a quiet status cue that
+     doesn't need reading, plus it stops the row looking like grey boxes */
+  .tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+    background:var(--accent);opacity:.55}
+  .tile b{display:block;font-size:17px;font-variant-numeric:tabular-nums;line-height:1.15}
+  .tile small{color:var(--text-muted);font-size:9.5px;text-transform:uppercase;letter-spacing:.07em}
+  .tile.jump{cursor:pointer}
+  .tile.jump:hover{transform:translateY(-1px);border-color:var(--accent);
+    box-shadow:0 4px 14px rgba(0,0,0,.4)}
+  .tile.flagged::before{background:var(--bad)} .tile.inbound::before{background:var(--warn)}
+  /* when a counter is actually non-zero, make the whole tile say so */
+  .tile.flagged.hot{border-color:rgba(208,59,59,.55);background:linear-gradient(180deg,#40282b,#312024)}
+  .tile.flagged.hot b{color:#ff8f8f}
+  .tile.inbound.hot{border-color:rgba(250,178,25,.5);background:linear-gradient(180deg,#3e3521,#2e281b)}
+  .tile.inbound.hot b{color:#ffce6a}
+  .hbtn,#quitBtn{align-self:center;background:var(--surface-3);color:var(--text-secondary);
+    border:1px solid var(--border);border-radius:9px;padding:6px 12px;font:inherit;font-size:11px;
+    cursor:pointer;transition:all .16s}
+  .hbtn:hover{border-color:var(--accent);color:var(--text-primary);
+    box-shadow:0 0 0 1px rgba(57,135,229,.2)}
+  .hbtn.on{background:linear-gradient(180deg,rgba(57,135,229,.3),rgba(57,135,229,.15));
+    border-color:var(--accent);color:var(--text-primary);
+    box-shadow:0 0 0 1px rgba(57,135,229,.25),0 2px 12px rgba(57,135,229,.2)}
   #quitBtn:hover{border-color:var(--bad);color:var(--text-primary)}
   main{display:grid;grid-template-columns:1fr 340px;min-height:0}
+  #mapwrap{position:relative;min-height:0;min-width:0;overflow:hidden}
   #map{height:100%;background:var(--surface-1)}
+  /* Identity by default (see --map-* above). Scoped to the CARTO layer, NOT the
+     whole tile pane, so the OSM fallback keeps its own treatment below and so
+     markers, arcs and tooltips (other panes) keep their true colour. */
+  .nm-base{filter:brightness(var(--map-bright)) sepia(var(--map-sepia))
+    saturate(var(--map-sat)) hue-rotate(var(--map-hue)) contrast(var(--map-contrast))}
+  /* Keep Leaflet's own controls clear of the view-tab strip along the bottom. */
+  .leaflet-bottom{margin-bottom:41px}
+  .leaflet-control-attribution{background:rgba(33,36,41,.82)!important;
+    color:var(--text-muted)!important;border-radius:6px 0 0 0;font-size:10px}
+  .leaflet-control-attribution a{color:var(--text-secondary)!important}
   aside{border-left:1px solid var(--border);background:var(--surface-2);display:flex;flex-direction:column;min-height:0}
   .filter{padding:10px 12px;border-bottom:1px solid var(--border)}
   .filter input{width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);
@@ -3102,10 +3161,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);
     background:var(--surface-2);position:sticky;top:0;border-top:1px solid var(--border);z-index:2}
   .section-hd a{color:var(--series-1);cursor:pointer;text-transform:none;letter-spacing:0;font-size:11px}
-  .row{padding:8px 12px;border-bottom:1px solid #262623;cursor:pointer}
-  .row:hover{background:var(--surface-3)}
+  .row{padding:8px 12px;border-bottom:1px solid var(--border-soft);cursor:pointer;
+    border-left:3px solid transparent;transition:background .13s,border-color .13s}
+  .row:hover{background:var(--surface-3);border-left-color:var(--accent)}
   .row.off{opacity:.45}
-  .row.sel{background:#20303f;box-shadow:inset 3px 0 0 var(--series-1)}
+  .row.sel{background:linear-gradient(90deg,rgba(57,135,229,.16),transparent 70%);
+    border-left-color:var(--accent)}
   .row .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
   .row .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     display:flex;align-items:center;gap:7px}
@@ -3131,6 +3192,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   @keyframes pulse{0%{opacity:.8;transform:scale(1)}100%{opacity:0;transform:scale(3)}}
   path.nm-arc{stroke-dasharray:3 9;animation:dash 1.1s linear infinite}
   @keyframes dash{to{stroke-dashoffset:-12}}
+  /* OSM fallback: inverted to dark, matching the CARTO layer it stands in for */
   .osm-dark{filter:invert(1) hue-rotate(180deg) brightness(.85) saturate(.35) contrast(.95)}
   #banner{position:absolute;left:50%;top:64px;transform:translateX(-50%);z-index:1000;
     background:var(--surface-2);border:1px solid var(--warn);color:var(--text-primary);
@@ -3140,14 +3202,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #stopped b{display:block;font-size:18px;color:var(--text-primary);margin-bottom:6px}
   /* threat + badges + bytes */
   .nm-dot.bad .core{background:var(--bad)} .nm-dot.bad .ring{border-color:var(--bad)}
-  .row.flag{box-shadow:inset 3px 0 0 var(--bad)}
+  .row.flag{border-left-color:var(--bad);
+    background:linear-gradient(90deg,rgba(208,59,59,.12),transparent 60%)}
   .badge2{font-size:9px;padding:1px 5px;border-radius:4px;font-weight:600;flex:none;
     text-transform:uppercase;letter-spacing:.03em}
   .badge2.doh{background:#4a2020;color:#ff9d9d} .badge2.dns{background:#4a3a10;color:#f4c256}
   .badge2.dot{background:#1a3a4a;color:#7dd3fc}
   .badge2.threat{background:var(--bad);color:#fff}
   .kindrow.open{background:var(--surface-3)}
-  .kinddevs{padding:2px 12px 8px 22px;border-bottom:1px solid #262623}
+  .kinddevs{padding:2px 12px 8px 22px;border-bottom:1px solid var(--border-soft)}
   .kinddev{display:flex;justify-content:space-between;gap:8px;font-size:12px;
     color:var(--text-secondary);padding:3px 0}
   .kinddev .cnt{color:var(--text-muted);font-size:11px;flex:none}
@@ -3158,7 +3221,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .tile.jump{cursor:pointer}
   .tile.jump:hover{background:#3a2a2a}
   /* flagged (retained threat event) rows */
-  .flg{padding:8px 12px;border-bottom:1px solid #262623;border-left:3px solid var(--bad);
+  .flg{padding:8px 12px;border-bottom:1px solid var(--border-soft);border-left:3px solid var(--bad);
     cursor:pointer}
   .flg:hover{background:var(--surface-3)}
   .flg .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
@@ -3177,7 +3240,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .info:hover{border-color:var(--series-1);color:var(--text-primary)}
   .vendor{color:var(--text-muted);font-weight:400;font-size:11px}
   /* top talkers */
-  .tt-row{padding:7px 12px;border-bottom:1px solid #262623}
+  .tt-row{padding:7px 12px;border-bottom:1px solid var(--border-soft)}
   .tt-row .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
   .tt-row .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .tt-row .tot{color:var(--text-secondary);font-size:11px;flex:none;font-variant-numeric:tabular-nums}
@@ -3186,7 +3249,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .bar i.dl{background:var(--series-1)}
   .updown{color:var(--text-muted);font-size:10px;margin-top:2px}
   /* inbound rows */
-  .inb{padding:8px 12px;border-bottom:1px solid #262623;border-left:3px solid var(--warn)}
+  .inb{padding:8px 12px;border-bottom:1px solid var(--border-soft);border-left:3px solid var(--warn)}
   .inb.bad{border-left-color:var(--bad)}
   .inb .nm{font-weight:600}
   .inb .meta{color:var(--text-secondary);font-size:12px;margin-top:1px}
@@ -3200,15 +3263,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding:3px 9px !important;margin-right:8px;color:var(--text-secondary) !important}
   #alertClear:hover{border-color:var(--bad) !important;color:var(--text-primary) !important}
   /* header alert button */
-  #alertBtn{align-self:center;background:var(--surface-3);border:1px solid var(--border);
-    color:var(--text-secondary);border-radius:8px;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer;position:relative}
-  #alertBtn.has{border-color:var(--warn);color:var(--text-primary)}
+  #alertBtn{position:relative}
+  #alertBtn.has{border-color:var(--warn);color:var(--text-primary);
+    box-shadow:0 0 0 1px rgba(250,178,25,.22)}
   #alertBtn .n{background:var(--bad);color:#fff;border-radius:999px;padding:0 5px;font-size:10px;margin-left:4px}
   /* segmented toggle */
   .seg{display:flex;gap:2px;padding:8px 12px 4px;background:var(--surface-2)}
   .seg button{flex:1;background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
-    padding:5px;font:inherit;font-size:11px;cursor:pointer;border-radius:6px}
-  .seg button.on{background:#20303f;border-color:var(--series-1);color:var(--text-primary)}
+    padding:5px;font:inherit;font-size:11px;cursor:pointer;border-radius:7px;transition:all .15s}
+  .seg button:hover{color:var(--text-primary);border-color:var(--accent)}
+  .seg button.on{background:linear-gradient(180deg,rgba(57,135,229,.28),rgba(57,135,229,.14));
+    border-color:var(--accent);color:var(--text-primary);
+    box-shadow:0 0 0 1px rgba(57,135,229,.22)}
   /* alerts panel */
   #alerts{position:absolute;top:0;right:0;width:380px;max-width:92vw;height:100%;z-index:1500;
     background:var(--surface-2);border-left:1px solid var(--border);box-shadow:-8px 0 24px #0009;
@@ -3229,33 +3295,69 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .dseg{display:flex;gap:2px;padding:8px 12px;border-bottom:1px solid var(--border)}
   .dseg button{flex:1;background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
     padding:5px;font:inherit;font-size:11px;cursor:pointer;border-radius:6px}
-  .dseg button.on{background:#20303f;border-color:var(--series-1);color:var(--text-primary)}
+  .dseg button.on{background:rgba(57,135,229,.16);border-color:var(--series-1);color:var(--text-primary)}
   #digestBody{overflow-y:auto;flex:1;padding:4px 0 30px}
   .dg-hero{padding:14px;text-align:center;border-bottom:1px solid var(--border)}
   .dg-hero b{display:block;font-size:26px;font-variant-numeric:tabular-nums}
   .dg-hero small{color:var(--text-muted);font-size:12px}
   .dg-stats{display:flex;justify-content:space-around;padding:10px 8px;border-bottom:1px solid var(--border);text-align:center}
   .dg-stats div b{display:block;font-size:16px} .dg-stats div small{color:var(--text-muted);font-size:10px;text-transform:uppercase}
-  #digestBtn,#vizBtn{align-self:center;background:var(--surface-3);border:1px solid var(--border);
-    color:var(--text-secondary);border-radius:8px;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}
-  #digestBtn:hover,#vizBtn:hover{border-color:var(--series-1);color:var(--text-primary)}
-  /* visualizations panel */
-  #viz{position:absolute;top:0;right:0;width:620px;max-width:96vw;height:100%;z-index:1600;
-    background:var(--surface-2);border-left:1px solid var(--border);
-    transform:translateX(102%);transition:transform .18s ease;display:flex;flex-direction:column}
-  #viz.open{transform:none}
-  #viz .hd{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;
-    border-bottom:1px solid var(--border);font-weight:600}
-  #viz .hd button{background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer}
-  .vseg{display:flex;gap:2px;padding:8px 12px;border-bottom:1px solid var(--border)}
-  .vseg button{flex:1;background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
-    border-radius:6px;padding:5px 4px;font:inherit;font-size:11px;cursor:pointer}
-  .vseg button.on{background:#20303f;border-color:var(--series-1);color:var(--text-primary)}
-  .vwin{display:flex;gap:8px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--border);
-    font-size:11px;color:var(--text-muted)}
-  .vwin select{background:var(--surface-3);color:var(--text-secondary);border:1px solid var(--border);
-    border-radius:6px;padding:3px 6px;font:inherit;font-size:11px}
-  #vizBody{overflow-y:auto;flex:1;padding:10px 12px 40px}
+  /* ---- visualizations dock: rides along the bottom edge of the map -------- */
+  /* Three states: hidden (default), docked (a strip over the map's lower edge)
+     and max (fills the map area). Absolutely positioned rather than a grid row
+     so Leaflet's canvas never resizes — toggling is instant and jank-free. */
+  /* The tab strip is always on screen along the map's bottom edge; the body
+     grows upward out of it. No entry point in the header — the views ARE the
+     control, the way a set of tabs should be. */
+  #viz{position:absolute;left:0;right:0;bottom:0;z-index:900;
+    display:flex;flex-direction:column;pointer-events:none}
+  #vizBody{height:0;overflow:auto;flex:none;padding:0 14px;pointer-events:auto;
+    background:linear-gradient(180deg,rgba(40,44,50,.93),rgba(33,36,41,.98));
+    backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);
+    border-top:1px solid transparent;
+    transition:height .22s cubic-bezier(.4,0,.2,1),padding .22s ease,border-color .22s ease}
+  #viz.open #vizBody{padding:10px 14px 14px;border-top-color:var(--border);
+    box-shadow:0 -10px 30px rgba(0,0,0,.45)}
+  .vbar{display:flex;align-items:stretch;padding:0;flex:none;
+    pointer-events:auto;border-top:1px solid var(--border);
+    background:linear-gradient(180deg,rgba(46,51,58,.90),rgba(36,40,46,.96));
+    backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2)}
+  /* the controls are meaningless with nothing open */
+  #viz:not(.open) .vctl{display:none}
+  .vctl{position:absolute;top:9px;right:14px;z-index:3;display:flex;align-items:center;
+    gap:8px;pointer-events:auto}
+  .vctl #vizStamp{font-size:10.5px;color:var(--text-muted);white-space:nowrap}
+  .vctl select{background:var(--surface-3);color:var(--text-secondary);border:1px solid var(--border);
+    border-radius:7px;padding:4px 7px;font:inherit;font-size:11px;cursor:pointer}
+  .vctl select:hover{border-color:var(--accent)}
+  .vicon{background:none;border:1px solid transparent;color:var(--text-muted);font-size:13px;
+    cursor:pointer;border-radius:7px;width:26px;height:24px;line-height:1;transition:all .15s}
+  .vicon:hover{color:var(--text-primary);border-color:var(--border);background:var(--surface-3)}
+  #viz.max #vizMax{transform:rotate(180deg)}
+  /* Four equal tabs spanning the full width of the map, sized to be an easy
+     target rather than a toolbar afterthought. */
+  .vseg{display:flex;flex:1;gap:0}
+  .vseg button{flex:1;background:none;border:none;border-right:1px solid var(--border-soft);
+    border-top:3px solid transparent;color:var(--text-secondary);
+    padding:11px 8px 12px;font:inherit;font-size:13px;font-weight:500;cursor:pointer;
+    transition:all .15s;white-space:nowrap;letter-spacing:.02em}
+  .vseg button:last-child{border-right:none}
+  .vseg button:hover{color:var(--text-primary);background:rgba(255,255,255,.05)}
+  .vseg button.on{background:linear-gradient(180deg,rgba(57,135,229,.26),rgba(57,135,229,.07));
+    border-top-color:var(--accent);color:var(--text-primary);font-weight:600}
+  /* Constellation and Flow are fixed-aspect drawings. In a wide, short dock the
+     win is to give the drawing the full height and stand the legend beside it
+     as a column, rather than stretching a square into a letterbox. */
+  #viz.open #vizBody.fit{display:flex;flex-direction:column;overflow:hidden;padding-bottom:6px}
+  #vizBody.fit .vfig{flex:1;min-height:0;display:flex;flex-direction:column}
+  #vizBody.fit .vfig svg.vchart{flex:1;min-height:0;width:100%;height:100%}
+  #vizBody.fit .vfig .vlegend{flex:none;margin:3px 0 0;justify-content:center}
+  /* In the short docked state the headings and explanatory notes are dead
+     weight; expand to max and they come back. */
+  #viz:not(.max) #vizBody .vnote{display:none}
+  #viz:not(.max) #vizBody h4{margin:0 0 3px;font-size:9.5px;opacity:.7}
+  #viz:not(.max) #vizBody.fit h4{display:none}
+  .fpgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:9px}
   #vizBody h4{margin:2px 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;
     color:var(--text-muted);font-weight:600}
   #vizBody .vnote{color:var(--text-muted);font-size:11px;margin:8px 2px 12px;line-height:1.5}
@@ -3273,7 +3375,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .vtable{width:100%;border-collapse:collapse;font-size:11px;margin-top:6px}
   .vtable th{text-align:left;color:var(--text-muted);font-weight:600;text-transform:uppercase;
     font-size:10px;letter-spacing:.05em;padding:4px 6px;border-bottom:1px solid var(--border)}
-  .vtable td{padding:4px 6px;border-bottom:1px solid #262623;vertical-align:top}
+  .vtable td{padding:4px 6px;border-bottom:1px solid var(--border-soft);vertical-align:top}
   .vtable td.num{text-align:right;font-variant-numeric:tabular-nums}
   .fpcard{border:1px solid var(--border);border-radius:8px;padding:9px 11px;margin-bottom:8px;
     background:var(--surface-1)}
@@ -3302,10 +3404,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .dt-note small{display:block;color:var(--text-muted);font-size:10.5px;margin-top:5px;min-height:13px}
   .noteline{color:var(--text-secondary);font-size:11px;margin-top:2px;font-style:italic}
   .procline{color:var(--text-muted);font-size:11px;margin-top:2px}
-  .row.noted{border-left:3px solid var(--good)}
+  .row.noted{border-left-color:var(--good)}
   .badge2.v6{background:#3a2f52;color:#c9bdf0}
   .badge2.agent{background:#1f3a2c;color:#8fd6ab}
-  .al{padding:9px 14px;border-bottom:1px solid #262623;border-left:3px solid var(--text-muted)}
+  .al{padding:9px 14px;border-bottom:1px solid var(--border-soft);border-left:3px solid var(--text-muted)}
   .al.critical{border-left-color:var(--bad)} .al.warning{border-left-color:var(--warn)}
   .al.notice{border-left-color:var(--series-1)} .al.info{border-left-color:var(--text-muted)}
   .al .k{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted)}
@@ -3324,8 +3426,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cursor:pointer;flex:none}
   #detailBody{overflow-y:auto;flex:1;padding:0 0 40px}
   .dt-verdict{padding:12px 14px;border-bottom:1px solid var(--border)}
-  .dt-verdict.bad{background:#2a1414;border-left:3px solid var(--bad)}
-  .dt-verdict.ok{background:#16221a;border-left:3px solid var(--good)}
+  .dt-verdict.bad{background:#3a2124;border-left:3px solid var(--bad)}
+  .dt-verdict.ok{background:#1e2f26;border-left:3px solid var(--good)}
   .dt-verdict b{display:block;font-size:14px;margin-bottom:3px}
   .dt-verdict p{margin:5px 0 0;color:var(--text-secondary);font-size:12px}
   .dt-kv{display:grid;grid-template-columns:104px 1fr;gap:3px 10px;padding:10px 14px;
@@ -3333,7 +3435,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .dt-kv dt{color:var(--text-muted)}
   .dt-kv dd{margin:0;overflow-wrap:anywhere}
   .dt-mono{font-family:Consolas,ui-monospace,monospace}
-  .dt-row{padding:8px 14px;border-bottom:1px solid #262623;font-size:12px}
+  .dt-row{padding:8px 14px;border-bottom:1px solid var(--border-soft);font-size:12px}
   .dt-row .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
   .dt-row b{font-weight:600}
   .dt-row .sub{color:var(--text-muted);font-size:11px;margin-top:2px}
@@ -3346,16 +3448,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   @media (max-width:900px){
     main{grid-template-columns:1fr;grid-template-rows:34vh minmax(0,1fr)}
     #map{min-height:0}
+    /* the dock has little room to share on a phone, so it takes the whole map */
+    #viz.open{height:100%}
+    .vseg button{padding:5px 8px;font-size:10px}
+    .vbar{gap:6px;padding:6px 8px}
+    .vbar #vizStamp{display:none}
     aside{border-left:none;border-top:1px solid var(--border);min-height:0}
     header{gap:6px;padding:7px 9px}
-    #ver{display:none}
+    #ver,.tag{display:none}
+    .logo{width:24px;height:24px}
     .pill{font-size:10px;padding:2px 8px}
     .tiles{gap:5px;width:100%;margin-left:0}
     .tile{min-width:0;padding:3px 7px;text-align:center}
     .tile b{font-size:14px}
     .tile small{font-size:9px;letter-spacing:0;white-space:nowrap}
     #digestBtn,#alertBtn,#quitBtn{padding:5px 8px}
-    #detail,#alerts,#digest,#viz{width:100%;max-width:100%}
+    #detail,#alerts,#digest{width:100%;max-width:100%}
     #banner{top:auto;bottom:12px}
   }
 </style>
@@ -3363,7 +3471,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 <div id="app">
   <header>
-    <h1>Net<span>Watch</span></h1>
+    <div class="brand">
+      <!-- Wordmark and mark are one object: the name sits on a connection trace
+           that carries two nodes, then leaves the word and terminates in a
+           flagged red blip. No separate glyph to interpret — the logo IS the
+           thing the dashboard does. textLength pins the width so the trace
+           geometry holds whatever font actually resolves. -->
+      <h1><svg class="logo" viewBox="0 0 152 44" role="img" aria-label="NetWatch">
+        <defs><linearGradient id="nwGrad" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stop-color="#5aa0f0"/><stop offset="1" stop-color="#9085e9"/>
+        </linearGradient></defs>
+        <text x="1" y="27" textLength="116" lengthAdjust="spacingAndGlyphs"
+          font-size="23" font-weight="700" letter-spacing=".2"
+          font-family="Segoe UI,system-ui,-apple-system,sans-serif"
+          fill="var(--text-primary)">Net<tspan fill="url(#nwGrad)">Watch</tspan></text>
+        <path d="M1 36 H118 C126 36 128 33 131 28 L136 18" fill="none"
+          stroke="url(#nwGrad)" stroke-width="2" stroke-linecap="round"
+          stroke-opacity=".9"/>
+        <circle cx="30" cy="36" r="2.7" fill="url(#nwGrad)"/>
+        <circle cx="78" cy="36" r="2.7" fill="url(#nwGrad)"/>
+        <circle class="lblip" cx="137.5" cy="14.5" r="4.2" fill="#e2564f"/>
+      </svg></h1>
+      <small class="tag">Every device. Every destination. One map.</small>
+    </div>
     <span id="ver" title="running build">v–</span>
     <span class="pill" id="capPill"><span class="led"></span><span id="capTxt">capture</span></span>
     <span class="pill" id="geoPill"><span class="led"></span><span id="geoTxt">geo: waiting</span></span>
@@ -3378,14 +3508,41 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="tile inbound jump" id="tileInbound"
         title="Unsolicited inbound sources seen recently — click to jump to the list">
         <b id="tInbound">–</b><small>inbound</small></div>
-      <button id="vizBtn" title="Constellation, flow, weather and device fingerprints">&#9680; views</button>
-      <button id="digestBtn" title="Show a summary">&#9776; digest</button>
-      <button id="alertBtn" title="Show alerts">&#9873; alerts<span class="n" id="alertN" style="display:none">0</span></button>
+      <button id="digestBtn" class="hbtn" title="Show a summary">&#9776; digest</button>
+      <button id="alertBtn" class="hbtn" title="Show alerts">&#9873; alerts<span class="n" id="alertN" style="display:none">0</span></button>
       <button id="quitBtn" title="Stop NetWatch">&#10005; quit</button>
     </div>
   </header>
   <main>
-    <div id="map"></div>
+    <div id="mapwrap">
+      <div id="map"></div>
+      <div id="viz">
+        <!-- window + expand/close ride at the top-right of the open dock, so the
+             tab strip below stays four equal tabs and nothing collides with
+             Leaflet's attribution in the map's bottom-right corner -->
+        <div class="vctl">
+          <select id="vizHours" title="Time window">
+            <option value="1">1 hour</option>
+            <option value="6">6 hours</option>
+            <option value="24" selected>24 hours</option>
+            <option value="168">7 days</option>
+            <option value="720">30 days</option>
+          </select>
+          <span id="vizStamp"></span>
+          <button id="vizMax" class="vicon" title="Fill the map">&#9650;</button>
+          <button id="vizHide" class="vicon" title="Close (Esc)">&times;</button>
+        </div>
+        <div id="vizBody"><div class="vempty">Loading&hellip;</div></div>
+        <div class="vbar">
+          <div class="vseg">
+            <button data-view="constellation">Constellation</button>
+            <button data-view="flow">Flow</button>
+            <button data-view="weather">Weather</button>
+            <button data-view="fingerprint">Fingerprint</button>
+          </div>
+        </div>
+      </div>
+    </div>
     <aside>
       <div class="filter"><input id="q" type="search"
         placeholder="Filter by device, host, IP, country&hellip;" autocomplete="off"></div>
@@ -3414,25 +3571,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
   <div id="digestBody"><div class="empty">Loading&hellip;</div></div>
 </div>
-<div id="viz">
-  <div class="hd"><span>Visualizations</span><button id="vizClose">&times;</button></div>
-  <div class="vseg">
-    <button data-view="constellation" class="on">Constellation</button>
-    <button data-view="flow">Flow</button>
-    <button data-view="weather">Weather</button>
-    <button data-view="fingerprint">Fingerprint</button>
-  </div>
-  <div class="vwin"><label for="vizHours">window</label>
-    <select id="vizHours">
-      <option value="1">1 hour</option>
-      <option value="6">6 hours</option>
-      <option value="24" selected>24 hours</option>
-      <option value="168">7 days</option>
-      <option value="720">30 days</option>
-    </select>
-    <span id="vizStamp"></span></div>
-  <div id="vizBody"><div class="vempty">Loading&hellip;</div></div>
-</div>
 <div id="detail">
   <div class="hd"><span class="t" id="detailTitle">Details</span>
     <button id="detailClose" title="Close (Esc)">&times;</button></div>
@@ -3443,7 +3581,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 "use strict";
-const PALETTE=["#3987e5","#008300","#d55181","#c98500","#199e70","#d95926","#9085e9","#e66767"];
+// Series 2 was #008300, which fell to 2.8:1 against the lighter grey surfaces
+// (validated with the palette checker); #0f9b0f clears 3:1 and leaves the CVD
+// separations intact.
+const PALETTE=["#3987e5","#0f9b0f","#d55181","#c98500","#199e70","#d95926","#9085e9","#e66767"];
 const HAS_MAP=typeof L!=="undefined";
 let map=null,tileBanner=null;
 if(HAS_MAP){
@@ -3451,7 +3592,7 @@ if(HAS_MAP){
   const osmAttr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
   let tileOK=false,tileErr=0,fell=false;
   const carto=L.tileLayer("https://{s}.basemap.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-    {attribution:osmAttr+' &copy; <a href="https://carto.com/attributions">CARTO</a>',subdomains:"abcd",maxZoom:19}).addTo(map);
+    {attribution:osmAttr+' &copy; <a href="https://carto.com/attributions">CARTO</a>',subdomains:"abcd",maxZoom:19,className:"nm-base"}).addTo(map);
   function fallback(){if(fell)return;fell=true;map.removeLayer(carto);
     const osm=L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:osmAttr,maxZoom:19,className:"osm-dark"});
     let ok=false;osm.on("tileload",()=>ok=true);
@@ -3531,6 +3672,10 @@ function render(d){
   document.getElementById("tDests").textContent=d.stats.dests;
   document.getElementById("tFlagged").textContent=d.stats.flagged;
   document.getElementById("tInbound").textContent=d.stats.inbound||0;
+  // "hot" tints the whole tile when a counter is non-zero, so a glance at the
+  // header tells you whether anything needs looking at.
+  document.getElementById("tileFlagged").classList.toggle("hot",!!d.stats.flagged);
+  document.getElementById("tileInbound").classList.toggle("hot",!!(d.stats.inbound||0));
   // Both counters are event counters over the SAME retention window, so flagged can
   // never drain faster than inbound. Say so in the tooltip.
   const rh=d.stats.event_retain_h||6;
@@ -4019,7 +4164,7 @@ let vizView="constellation", vizHours=24, vizData=null, vizBusy=false;
 // surface. Magnitude is lightness, never a second hue.
 const RAMP=["#22303f","#243f5c","#27507b","#2a6199","#2f74bd","#3987e5","#69a6ef","#a3ccf7"];
 function rampFor(v,max){
-  if(!max||v<=0)return "#1f2a33";
+  if(!max||v<=0)return "#2b3038";
   const t=Math.log2(1+v)/Math.log2(1+max);
   return RAMP[Math.max(0,Math.min(RAMP.length-1,Math.round(t*(RAMP.length-1))))];
 }
@@ -4045,9 +4190,18 @@ function renderViz(){
   const stamp=document.getElementById("vizStamp");
   if(!vizData){ body.innerHTML='<div class="vempty">Could not load visualization data.</div>'; return; }
   stamp.textContent=vizData.generated?("updated "+ago(vizData.generated)):"";
-  if(vizView==="constellation")body.innerHTML=vizConstellation(vizData.constellation);
-  else if(vizView==="flow")body.innerHTML=vizFlow(vizData.flow);
-  else if(vizView==="weather")body.innerHTML=vizWeather(vizData.weather);
+  // Charts are drawn at the container's REAL pixel size, so the viewBox is 1:1
+  // with the screen and 11px label text stays 11px. Scaling a fixed 580-wide
+  // viewBox up to a 1200px dock would blow the type up with it.
+  const bw=Math.max(360,Math.min((body.clientWidth||900)-30,1400));
+  // the constellation's legend sits under the drawing, so leave it a strip
+  const bh=Math.max(190,(body.clientHeight||300)-38);
+  // Only the constellation is a fixed square; everything else wants the width.
+  body.classList.toggle("fit",vizView==="constellation");
+  if(vizView==="constellation")
+    body.innerHTML=vizConstellation(vizData.constellation,bw,bh);
+  else if(vizView==="flow")body.innerHTML=vizFlow(vizData.flow,bw);
+  else if(vizView==="weather")body.innerHTML=vizWeather(vizData.weather,bw);
   else body.innerHTML=vizFingerprint(vizData.fingerprint);
   body.querySelectorAll("[data-ip]").forEach(el=>el.addEventListener("click",()=>{
     const ip=el.getAttribute("data-ip");
@@ -4057,17 +4211,24 @@ function renderViz(){
 
 // --- Constellation: device -> destination, laid out radially so each device
 // owns an angular sector and its destinations fan out inside it.
-function vizConstellation(c){
+function vizConstellation(c,W,H){
   const devs=(c&&c.devices||[]).filter(d=>d.bytes>0);
   if(!devs.length)return '<div class="vempty">No traffic in this window yet.</div>';
   const links=c.links||[];
   const byDev=new Map();
   for(const l of links){ if(!byDev.has(l.dev))byDev.set(l.dev,[]); byDev.get(l.dev).push(l); }
-  const W=580,H=580,cx=W/2,cy=H/2,r1=86,r2=178;
-  const maxB=Math.max(...links.map(l=>l.bytes),1);
+  // Laid out on an ELLIPSE that fills whatever rectangle it's given, rather than
+  // a circle in a square. A dock is wide and short, so a circle would have to
+  // shrink to the short side and waste the width; an ellipse uses all of it and
+  // becomes round again when the view is expanded to fill the map.
+  W=W||580; H=H||W;
+  const LABEL=104, cx=W/2, cy=H/2;
+  const rx=Math.max(60,W/2-LABEL), ry=Math.max(42,H/2-30);
+  const r1x=rx*0.44, r1y=ry*0.44;
   const total=devs.reduce((s,d)=>s+Math.max(d.bytes,1),0);
   let a0=-Math.PI/2, marks="", nodes="", labels="";
-  marks+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r1+'" fill="none" class="grid" stroke-dasharray="2 4"/>';
+  marks+='<ellipse cx="'+cx+'" cy="'+cy+'" rx="'+r1x.toFixed(1)+'" ry="'+r1y.toFixed(1)+
+    '" fill="none" class="grid" stroke-dasharray="2 4"/>';
   let di=-1;
   for(const d of devs){
     di++;
@@ -4075,7 +4236,7 @@ function vizConstellation(c){
     const span=Math.max(share*Math.PI*2,0.34);      // floor so a quiet device is still readable
     const mid=a0+span/2;
     const col=colorFor(d.ip);
-    const dx=cx+Math.cos(mid)*r1, dy=cy+Math.sin(mid)*r1;
+    const dx=cx+Math.cos(mid)*r1x, dy=cy+Math.sin(mid)*r1y;
     // home -> device spoke
     marks+='<line x1="'+cx+'" y1="'+cy+'" x2="'+dx.toFixed(1)+'" y2="'+dy.toFixed(1)+
       '" stroke="'+col+'" stroke-width="1.5" opacity=".45"/>';
@@ -4083,11 +4244,12 @@ function vizConstellation(c){
     ls.forEach((l,i)=>{
       const t=ls.length===1?0.5:(i+0.5)/ls.length;
       const ang=a0+span*t;
-      const ex=cx+Math.cos(ang)*r2, ey=cy+Math.sin(ang)*r2;
+      const ex=cx+Math.cos(ang)*rx, ey=cy+Math.sin(ang)*ry;
       const bad=!!l.threat;
       const w=Math.max(1,Math.min(1+Math.log2(1+l.bytes/1024)*0.42,7));
-      const mx=cx+Math.cos((mid+ang)/2)*((r1+r2)/2);
-      const my=cy+Math.sin((mid+ang)/2)*((r1+r2)/2);
+      const ma=(mid+ang)/2;
+      const mx=cx+Math.cos(ma)*((r1x+rx)/2);
+      const my=cy+Math.sin(ma)*((r1y+ry)/2);
       marks+='<path d="M'+dx.toFixed(1)+','+dy.toFixed(1)+' Q'+mx.toFixed(1)+','+my.toFixed(1)+
         ' '+ex.toFixed(1)+','+ey.toFixed(1)+'" fill="none" stroke="'+(bad?"#d03b3b":col)+
         '" stroke-width="'+w.toFixed(2)+'" opacity="'+(bad?".85":".4")+'"/>';
@@ -4097,12 +4259,13 @@ function vizConstellation(c){
         (bad?"#d03b3b":col)+'" stroke="var(--surface-2)" stroke-width="2"><title>'+
         esc(l.node)+"\n"+esc(fmtBytes(l.bytes))+(l.cc?" · "+esc(l.cc):"")+
         (bad?"\nON THREAT LIST":"")+'</title></circle>';
-      const deg=ang*180/Math.PI, flip=(deg>90||deg<-90);
-      const lr=rad+5;
-      labels+='<g transform="translate('+ex.toFixed(1)+','+ey.toFixed(1)+') rotate('+
-        (flip?deg+180:deg).toFixed(1)+')"><text class="mut" x="'+(flip?-lr:lr)+
-        '" y="3" text-anchor="'+(flip?"end":"start")+'" style="font-size:9px">'+
-        esc(shortLabel(l.node,15))+"</text></g>";
+      // Horizontal labels anchored away from the centre. On an ellipse the
+      // nodes fan out mostly sideways, which is exactly where the room is —
+      // rotating them radially would need vertical space a short dock hasn't got.
+      const left=Math.cos(ang)<0, lr=rad+5;
+      labels+='<text class="mut" x="'+(ex+(left?-lr:lr)).toFixed(1)+'" y="'+(ey+3).toFixed(1)+
+        '" text-anchor="'+(left?"end":"start")+'" style="font-size:9.5px">'+
+        esc(shortLabel(l.node,16))+"</text>";
     });
     nodes+='<circle cx="'+dx.toFixed(1)+'" cy="'+dy.toFixed(1)+'" r="6" fill="'+col+
       '" stroke="var(--surface-2)" stroke-width="2"><title>'+esc(d.name)+"\n"+
@@ -4111,8 +4274,8 @@ function vizConstellation(c){
     // each other in narrow sectors. Every device is still named in the legend
     // and on hover, so identity is never carried by colour alone.
     if(di<4){
-      const lr2=r1-16-(di%2)*15;
-      const lx=cx+Math.cos(mid)*lr2, ly=cy+Math.sin(mid)*lr2;
+      const k=1-(0.19+(di%2)*0.17);
+      const lx=cx+Math.cos(mid)*r1x*k, ly=cy+Math.sin(mid)*r1y*k;
       labels+='<text x="'+lx.toFixed(1)+'" y="'+ly.toFixed(1)+
         '" text-anchor="middle" style="font-size:10px;font-weight:600">'+
         esc(shortLabel(d.name,14))+"</text>";
@@ -4125,21 +4288,23 @@ function vizConstellation(c){
   const legend=devs.map(d=>'<span><i style="background:'+colorFor(d.ip)+'"></i>'+
     esc(shortLabel(d.name,18))+"</span>").join("");
   return "<h4>Who talks to whom</h4>"+
+    '<div class="vfig">'+
     '<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Device to destination link graph">'+
     marks+nodes+labels+"</svg>"+
-    '<div class="vlegend">'+legend+"</div>"+
+    '<div class="vlegend">'+legend+"</div></div>"+
     '<div class="vnote">Each spoke is a device; the dots around it are the destinations it '+
     "reached. Line thickness and dot size are data volume. Red marks a destination on a "+
     "threat list. Click a dot to open its details.</div>";
 }
 
 // --- Flow: a two-column Sankey of bytes, device -> country.
-function vizFlow(f){
+function vizFlow(f,W){
   const devs=(f&&f.devices||[]).filter(d=>d.bytes>0);
   const ccs=(f&&f.countries||[]).filter(c=>c.bytes>0);
   const links=(f&&f.links||[]).filter(l=>l.bytes>0);
   if(!devs.length||!ccs.length)return '<div class="vempty">No traffic in this window yet.</div>';
-  const W=580,pad=8,barW=13,leftX=118,rightX=W-118-barW;
+  W=W||580;
+  const pad=8,barW=13,leftX=118,rightX=W-118-barW;
   const rows=Math.max(devs.length,ccs.length);
   const H=Math.max(220,rows*34);
   const totalL=devs.reduce((s,d)=>s+d.bytes,0)||1;
@@ -4181,22 +4346,24 @@ function vizFlow(f){
   const legend=devs.map(d=>'<span><i style="background:'+(d.ip==="other"?"#6f6f68":colorFor(d.ip))+
     '"></i>'+esc(shortLabel(d.name,18))+"</span>").join("");
   return "<h4>Where the bytes go</h4>"+
+    '<div class="vfig">'+
     '<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Device to country bandwidth flow">'+
     ribs+bars+labels+"</svg>"+
-    '<div class="vlegend">'+legend+"</div>"+
+    '<div class="vlegend">'+legend+"</div></div>"+
     '<div class="vnote">Band thickness is total bytes moved in this window. Devices on the '+
     "left, destination countries on the right.</div>";
 }
 
 // --- Weather: activity over time. Short windows get bars; long windows get a
 // day x hour heatmap, which is where a routine (or a break in one) shows up.
-function vizWeather(w){
+function vizWeather(w,W){
   const b=(w&&w.buckets||[]);
   if(!b.length)return '<div class="vempty">No history in this window yet.</div>';
+  W=W||580;
   const peak=Math.max(...b.map(x=>x.bytes),1);
   let html="<h4>When the network is busy</h4>";
   if(b.length<=48){
-    const W=580,H=170,padL=52,padB=26,padT=8;
+    const H=170,padL=52,padB=26,padT=8;
     const n=b.length,bw=(W-padL-8)/n;
     let bars="",axis="";
     b.forEach((x,i)=>{
@@ -4224,18 +4391,18 @@ function vizWeather(w){
       if(!byDay.has(key)){ byDay.set(key,{ts:x.ts,cells:new Array(24).fill(null)}); days.push(key); }
       byDay.get(key).cells[d.getHours()]=x;
     }
-    const W=580,padL=48,cell=(W-padL-8)/24,rowH=15;
+    const padL=48,cell=(W-padL-8)/24,rowH=Math.max(14,Math.min(26,320/Math.max(days.length,1)));
     const H=days.length*rowH+34;
     let cells="",axis="";
     days.forEach((k,r)=>{
       const row=byDay.get(k);
-      cells+='<text class="mut" x="'+(padL-8)+'" y="'+(28+r*rowH+11)+'" text-anchor="end">'+
-        esc(dayLabel(row.ts))+"</text>";
+      cells+='<text class="mut" x="'+(padL-8)+'" y="'+(28+r*rowH+rowH/2+4).toFixed(1)+
+        '" text-anchor="end">'+esc(dayLabel(row.ts))+"</text>";
       for(let h=0;h<24;h++){
         const x=row.cells[h];
-        cells+='<rect x="'+(padL+h*cell+1).toFixed(1)+'" y="'+(28+r*rowH+1)+'" width="'+
-          Math.max(1,cell-2).toFixed(1)+'" height="'+(rowH-2)+'" rx="2" fill="'+
-          (x?rampFor(x.bytes,peak):"#1f2a33")+'"><title>'+esc(dayLabel(row.ts))+" "+
+        cells+='<rect x="'+(padL+h*cell+1).toFixed(1)+'" y="'+(28+r*rowH+1).toFixed(1)+'" width="'+
+          Math.max(1,cell-2).toFixed(1)+'" height="'+(rowH-2).toFixed(1)+'" rx="2" fill="'+
+          (x?rampFor(x.bytes,peak):"#2b3038")+'"><title>'+esc(dayLabel(row.ts))+" "+
           String(h).padStart(2,"0")+":00\n"+(x?esc(fmtBytes(x.bytes))+"\n"+x.devices+
           " devices · "+x.dests+" destinations":"no data")+"</title></rect>";
       }
@@ -4265,7 +4432,7 @@ function vizWeather(w){
       series=[...m.values()];
     }else series=b.map(x=>({ts:x.ts,alerts:x.alerts}));
     const maxA=Math.max(...series.map(x=>x.alerts),1);
-    const W=580,H=58,padL=52,padB=16,n=series.length,bw=(W-padL-8)/n;
+    const H=58,padL=52,padB=16,n=series.length,bw=(W-padL-8)/n;
     let ab="",ax="";
     series.forEach((x,i)=>{
       if(!x.alerts)return;
@@ -4303,12 +4470,13 @@ function vizFingerprint(fp){
       "history per device before it can say what is normal for it.</div>";
   let html="";
   if(devi.length){
-    html+="<h4>Recent deviations</h4>";
+    html+='<h4>Recent deviations</h4><div class="fpgrid">';
     for(const d of devi.slice(0,12))
       html+='<div class="dv '+esc(d.kind)+'"><b>'+esc(d.name||d.dev)+"</b> "+esc(d.detail)+
         "<small>"+esc(ago(d.ts))+"</small></div>";
+    html+="</div>";
   }
-  html+='<h4 style="margin-top:14px">Learned profiles</h4>';
+  html+='<h4 style="margin-top:14px">Learned profiles</h4><div class="fpgrid">';
   const nowH=new Date().getHours();
   for(const d of devs.slice(0,20)){
     const hod=(d.hod||"").padEnd(24,"0");
@@ -4331,23 +4499,69 @@ function vizFingerprint(fp){
       "this hour <code>"+esc(fmtBytes(d.cur_bytes))+" · "+d.cur_dests+
       " destinations</code></div></div>";
   }
+  html+="</div>";
   return html+'<div class="vnote">The strip is the hours of the day this device is normally '+
     "awake (the outlined cell is the hour now). Deviations fire once a device has enough "+
     "history to have a normal at all.</div>";
 }
 
-document.getElementById("vizBtn").addEventListener("click",()=>{
-  const opening=!vizPanel.classList.contains("open");
-  vizPanel.classList.toggle("open");
-  if(opening)loadViz();
-});
-document.getElementById("vizClose").addEventListener("click",()=>vizPanel.classList.remove("open"));
+// The tab strip is the control surface. Clicking a tab opens that view;
+// clicking the tab that's already showing closes the dock again. The chevron
+// swaps between the docked strip and filling the map.
+function vizState(){
+  if(!vizPanel.classList.contains("open"))return "off";
+  return vizPanel.classList.contains("max")?"max":"dock";
+}
+// The body's height is set in pixels rather than a percentage: the dock is
+// absolutely positioned, so it has no height of its own to take a % of, and
+// px values are what animate cleanly anyway.
+function vizSizeBody(){
+  const wrap=document.getElementById("mapwrap");
+  const bar=vizPanel.querySelector(".vbar");
+  const body=document.getElementById("vizBody");
+  const avail=Math.max(120,wrap.clientHeight-bar.offsetHeight-2);
+  const s=vizState();
+  body.style.height=s==="off"?"0px"
+    :(s==="max"?avail+"px":Math.min(360,Math.round(avail*0.62))+"px");
+}
+function vizSet(state,view){
+  if(view)vizView=view;
+  vizPanel.classList.toggle("open",state!=="off");
+  vizPanel.classList.toggle("max",state==="max");
+  document.querySelectorAll(".vseg button").forEach(x=>
+    x.classList.toggle("on",state!=="off"&&x.dataset.view===vizView));
+  vizSizeBody();
+  if(state==="off")return;
+  if(!vizData)loadViz(); else renderViz();
+}
+document.getElementById("vizMax").addEventListener("click",()=>
+  vizSet(vizState()==="max"?"dock":"max"));
+document.getElementById("vizHide").addEventListener("click",()=>vizSet("off"));
 document.querySelectorAll(".vseg button").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll(".vseg button").forEach(x=>x.classList.toggle("on",x===b));
-  vizView=b.dataset.view; renderViz();
+  const v=b.dataset.view;
+  // same tab again = close; a different tab = switch without changing height
+  if(vizState()!=="off"&&vizView===v)vizSet("off");
+  else vizSet(vizState()==="off"?"dock":vizState(),v);
 }));
 document.getElementById("vizHours").addEventListener("change",e=>{
   vizHours=+e.target.value; vizData=null; loadViz();
+});
+document.addEventListener("keydown",e=>{
+  if(e.target.matches("input,select,textarea"))return;
+  if(e.key==="v"||e.key==="V")vizSet(vizState()==="off"?"dock":"off");
+});
+// Charts are drawn at real pixel size, so they have to be redrawn when that
+// size changes — on window resize and whenever the dock finishes animating.
+let vizRedraw=null;
+window.addEventListener("resize",()=>{
+  clearTimeout(vizRedraw);
+  vizRedraw=setTimeout(()=>{
+    vizSizeBody();
+    if(vizState()!=="off"&&vizData)renderViz();
+  },160);
+});
+document.getElementById("vizBody").addEventListener("transitionend",e=>{
+  if(e.propertyName==="height"&&vizState()!=="off")renderViz();
 });
 
 // ---- Detail drawer: everything known about one remote IP -------------------
@@ -4360,6 +4574,8 @@ document.addEventListener("keydown",e=>{
   if(detailPanel.classList.contains("open"))closeDetail();
   else if(digestPanel.classList.contains("open"))digestPanel.classList.remove("open");
   else if(alertsPanel.classList.contains("open"))alertsPanel.classList.remove("open");
+  else if(vizPanel.classList.contains("max"))vizSet("dock");
+  else if(vizPanel.classList.contains("open"))vizSet("off");
 });
 async function openDetail(ip,dev){
   if(!ip)return;
