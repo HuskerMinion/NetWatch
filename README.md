@@ -287,7 +287,7 @@ Four readings of the same window (1 hour to 30 days):
 
 | View | Answers |
 |---|---|
-| **Constellation** | Who talks to whom. Each spoke is a device, the dots around it are its destinations, thickness and size are volume, red is a threat-list hit. |
+| **Constellation** | Who talks to whom, in two levels. The overview labels **devices** and draws their destinations as bare dots — hovering one device dims the rest. **Click a device** to drill into it: every connection gets its own row with hostname, country, volume bar and flagged marker, and clicking a row opens the full detail drawer. `Esc` or "← all devices" comes back out. |
 | **Flow** | Where the bytes go — a Sankey from device to destination country. |
 | **Weather** | When the network is busy. Bars per hour on short windows, a day × hour heatmap on long ones, with alerts charted underneath. |
 | **Fingerprint** | What normal looks like per device, and what recently broke it. |

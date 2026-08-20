@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.20.9"  # date + same-day build number, so successive changes on
+VERSION = "2026.08.20.10"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -2457,19 +2457,26 @@ def viz_data(hours=24):
         out["constellation"]["devices"] = devs
         keep = {d["ip"] for d in devs}
         per_dev = {}
-        for dev, node, b, cc, threat, host in con.execute(
+        for (dev, node, b, up, down, cc, threat, host, ip, nip, last, country
+             ) in con.execute(
                 "SELECT dev, COALESCE(NULLIF(host,''), rem) AS node, "
-                "SUM(up+down) AS b, MAX(COALESCE(cc,'')), MAX(COALESCE(threat,'')), "
-                "MAX(COALESCE(host,'')) FROM sessions WHERE last >= ? "
+                "SUM(up+down) AS b, SUM(up), SUM(down), MAX(COALESCE(cc,'')), "
+                "MAX(COALESCE(threat,'')), MAX(COALESCE(host,'')), MAX(rem), "
+                "COUNT(DISTINCT rem), MAX(last), MAX(COALESCE(country,'')) "
+                "FROM sessions WHERE last >= ? "
                 "GROUP BY dev, node ORDER BY b DESC", (since,)):
             if dev not in keep:
                 continue
             lst = per_dev.setdefault(dev, [])
-            if len(lst) >= 8:
+            # Keep more per device than the overview draws: the drill-down view
+            # has room for them, and truncating here would lose them for good.
+            if len(lst) >= 40:
                 continue
             lst.append({"dev": dev, "node": node, "bytes": b or 0,
+                        "up": up or 0, "down": down or 0,
                         "cc": cc or "", "threat": threat or "",
-                        "host": host or ""})
+                        "host": host or "", "ip": ip or "", "nip": nip or 1,
+                        "last": last, "country": country or ""})
         for lst in per_dev.values():
             out["constellation"]["links"].extend(lst)
 
@@ -3460,6 +3467,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .vlegend span{display:inline-flex;align-items:center;gap:5px}
   .vlegend i{width:9px;height:9px;border-radius:2px;display:inline-block}
   .vempty{color:var(--text-muted);text-align:center;padding:34px 10px;font-size:12px}
+  /* constellation: hovering one device dims the others — focus+context for
+     free, no JS, and it makes a busy overview readable a device at a time */
+  svg.cnst g.cdev{cursor:pointer;transition:opacity .13s}
+  /* :has() so the dimming only happens when a DEVICE is hovered — keyed on
+     :hover of the svg it would fire whenever the cursor crossed blank space */
+  svg.cnst:has(g.cdev:hover) g.cdev{opacity:.2}
+  /* must repeat the :has() or this loses the specificity race and everything,
+     including the device under the cursor, dims */
+  svg.cnst:has(g.cdev:hover) g.cdev:hover{opacity:1}
+  /* drill-down rows */
+  svg.cdet g.crow{cursor:pointer}
+  svg.cdet g.crow:hover .crowbg{fill:rgba(255,255,255,.07)}
+  .cbar{display:flex;align-items:center;gap:9px;margin:0 0 6px;flex-wrap:wrap}
+  .cbar b{font-size:13px}
+  .cbar .csw{width:10px;height:10px;border-radius:3px;flex:none}
+  .cbar .cmeta{color:var(--text-muted);font-size:11px}
+  .cback{background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
+    border-radius:7px;padding:4px 11px;font:inherit;font-size:11px;cursor:pointer}
+  .cback:hover{border-color:var(--accent);color:var(--text-primary)}
   .vretry{background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
     border-radius:7px;padding:6px 16px;font:inherit;font-size:11px;cursor:pointer}
   .vretry:hover{border-color:var(--accent);color:var(--text-primary)}
@@ -4256,6 +4282,7 @@ document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",
 // filter or a re-sort never repaints a device.
 const vizPanel=document.getElementById("viz");
 let vizView="constellation", vizHours=24, vizData=null, vizBusy=false, vizErr="";
+let vizFocus=null;      // device IP the constellation is drilled into, or null
 
 // sequential ramp: one hue (the series-1 blue), dim -> bright against the dark
 // surface. Magnitude is lightness, never a second hue.
@@ -4313,8 +4340,9 @@ function renderViz(){
   const bw=Math.max(360,Math.min((body.clientWidth||900)-30,1400));
   // the constellation's legend sits under the drawing, so leave it a strip
   const bh=Math.max(190,(body.clientHeight||300)-38);
-  // Only the constellation is a fixed square; everything else wants the width.
-  body.classList.toggle("fit",vizView==="constellation");
+  // The constellation OVERVIEW is a fixed-aspect drawing that should fit the
+  // dock; its drill-down is a list that should be free to grow and scroll.
+  body.classList.toggle("fit",vizView==="constellation"&&!vizFocus);
   if(vizView==="constellation")
     body.innerHTML=vizConstellation(vizData.constellation,bw,bh);
   else if(vizView==="flow")body.innerHTML=vizFlow(vizData.flow,bw);
@@ -4324,96 +4352,149 @@ function renderViz(){
     const ip=el.getAttribute("data-ip");
     if(isIP(ip))openDetail(ip,el.getAttribute("data-dev")||null);
   }));
+  // constellation: click a device to drill in, the back chip to come out
+  body.querySelectorAll("[data-focus]").forEach(el=>el.addEventListener("click",()=>{
+    vizFocus=el.getAttribute("data-focus"); renderViz();
+  }));
+  const back=body.querySelector(".cback");
+  if(back)back.addEventListener("click",()=>{ vizFocus=null; renderViz(); });
 }
 
 // --- Constellation: device -> destination, laid out radially so each device
 // owns an angular sector and its destinations fan out inside it.
+// Overview -> drill-down. Showing 10 devices x 8 destinations at once was ~80
+// labelled nodes competing for the same pixels, which is unreadable at any
+// size. So the overview labels DEVICES only and draws their destinations as
+// bare dots (shape without the label soup); clicking a device opens a
+// dendrogram of just that device's connections, where every one gets its own
+// row, its own label and a volume bar. Clicking a row opens the detail drawer.
 function vizConstellation(c,W,H){
   const devs=(c&&c.devices||[]).filter(d=>d.bytes>0);
   if(!devs.length)return '<div class="vempty">No traffic in this window yet.</div>';
   const links=c.links||[];
   const byDev=new Map();
   for(const l of links){ if(!byDev.has(l.dev))byDev.set(l.dev,[]); byDev.get(l.dev).push(l); }
-  // Laid out on an ELLIPSE that fills whatever rectangle it's given, rather than
-  // a circle in a square. A dock is wide and short, so a circle would have to
-  // shrink to the short side and waste the width; an ellipse uses all of it and
-  // becomes round again when the view is expanded to fill the map.
+  if(vizFocus&&byDev.has(vizFocus))return vizConstDetail(devs,byDev,W);
+  vizFocus=null;
+  return vizConstOverview(devs,byDev,W,H);
+}
+
+function vizConstOverview(devs,byDev,W,H){
   W=W||580; H=H||W;
-  const LABEL=104, cx=W/2, cy=H/2;
-  const rx=Math.max(60,W/2-LABEL), ry=Math.max(42,H/2-30);
-  const r1x=rx*0.44, r1y=ry*0.44;
+  const LABEL=92, cx=W/2, cy=H/2;
+  const rx=Math.max(60,W/2-LABEL), ry=Math.max(42,H/2-34);
+  const r1x=rx*0.46, r1y=ry*0.46;
   const total=devs.reduce((s,d)=>s+Math.max(d.bytes,1),0);
-  let a0=-Math.PI/2, marks="", nodes="", labels="";
-  marks+='<ellipse cx="'+cx+'" cy="'+cy+'" rx="'+r1x.toFixed(1)+'" ry="'+r1y.toFixed(1)+
-    '" fill="none" class="grid" stroke-dasharray="2 4"/>';
-  let di=-1;
+  let a0=-Math.PI/2, groups="";
   for(const d of devs){
-    di++;
     const share=Math.max(d.bytes,1)/total;
-    const span=Math.max(share*Math.PI*2,0.34);      // floor so a quiet device is still readable
-    const mid=a0+span/2;
-    const col=colorFor(d.ip);
+    const span=Math.max(share*Math.PI*2,0.34);
+    const mid=a0+span/2, col=colorFor(d.ip);
     const dx=cx+Math.cos(mid)*r1x, dy=cy+Math.sin(mid)*r1y;
-    // home -> device spoke
-    marks+='<line x1="'+cx+'" y1="'+cy+'" x2="'+dx.toFixed(1)+'" y2="'+dy.toFixed(1)+
-      '" stroke="'+col+'" stroke-width="1.5" opacity=".45"/>';
-    const ls=(byDev.get(d.ip)||[]).slice(0,8);
+    const ls=(byDev.get(d.ip)||[]).slice(0,10);
+    const bad=ls.some(l=>l.threat);
+    let inner='<line x1="'+cx+'" y1="'+cy+'" x2="'+dx.toFixed(1)+'" y2="'+dy.toFixed(1)+
+      '" stroke="'+col+'" stroke-width="1.6" opacity=".5"/>';
     ls.forEach((l,i)=>{
       const t=ls.length===1?0.5:(i+0.5)/ls.length;
       const ang=a0+span*t;
       const ex=cx+Math.cos(ang)*rx, ey=cy+Math.sin(ang)*ry;
-      const bad=!!l.threat;
-      const w=Math.max(1,Math.min(1+Math.log2(1+l.bytes/1024)*0.42,7));
+      const w=Math.max(1,Math.min(1+Math.log2(1+l.bytes/1024)*0.40,6));
       const ma=(mid+ang)/2;
-      const mx=cx+Math.cos(ma)*((r1x+rx)/2);
-      const my=cy+Math.sin(ma)*((r1y+ry)/2);
-      marks+='<path d="M'+dx.toFixed(1)+','+dy.toFixed(1)+' Q'+mx.toFixed(1)+','+my.toFixed(1)+
-        ' '+ex.toFixed(1)+','+ey.toFixed(1)+'" fill="none" stroke="'+(bad?"#d03b3b":col)+
-        '" stroke-width="'+w.toFixed(2)+'" opacity="'+(bad?".85":".4")+'"/>';
-      const rad=Math.max(2.6,Math.min(2.6+Math.log2(1+l.bytes/2048)*0.7,8));
-      nodes+='<circle class="hit" data-ip="'+esc(isIP(l.node)?l.node:"")+'" data-dev="'+esc(l.dev)+
-        '" cx="'+ex.toFixed(1)+'" cy="'+ey.toFixed(1)+'" r="'+rad.toFixed(1)+'" fill="'+
-        (bad?"#d03b3b":col)+'" stroke="var(--surface-2)" stroke-width="2"><title>'+
-        esc(l.node)+"\n"+esc(fmtBytes(l.bytes))+(l.cc?" · "+esc(l.cc):"")+
-        (bad?"\nON THREAT LIST":"")+'</title></circle>';
-      // Horizontal labels anchored away from the centre. On an ellipse the
-      // nodes fan out mostly sideways, which is exactly where the room is —
-      // rotating them radially would need vertical space a short dock hasn't got.
-      const left=Math.cos(ang)<0, lr=rad+5;
-      labels+='<text class="mut" x="'+(ex+(left?-lr:lr)).toFixed(1)+'" y="'+(ey+3).toFixed(1)+
-        '" text-anchor="'+(left?"end":"start")+'" style="font-size:9.5px">'+
-        esc(shortLabel(l.node,16))+"</text>";
+      inner+='<path d="M'+dx.toFixed(1)+','+dy.toFixed(1)+' Q'+
+        (cx+Math.cos(ma)*((r1x+rx)/2)).toFixed(1)+','+
+        (cy+Math.sin(ma)*((r1y+ry)/2)).toFixed(1)+' '+ex.toFixed(1)+','+ey.toFixed(1)+
+        '" fill="none" stroke="'+(l.threat?"#d03b3b":col)+'" stroke-width="'+w.toFixed(2)+
+        '" opacity="'+(l.threat?".9":".42")+'"/>';
+      const rad=Math.max(2.2,Math.min(2.2+Math.log2(1+l.bytes/4096)*0.6,6.5));
+      inner+='<circle cx="'+ex.toFixed(1)+'" cy="'+ey.toFixed(1)+'" r="'+rad.toFixed(1)+
+        '" fill="'+(l.threat?"#d03b3b":col)+'" stroke="var(--surface-1)" stroke-width="1.5"/>';
     });
-    nodes+='<circle cx="'+dx.toFixed(1)+'" cy="'+dy.toFixed(1)+'" r="6" fill="'+col+
-      '" stroke="var(--surface-2)" stroke-width="2"><title>'+esc(d.name)+"\n"+
-      esc(fmtBytes(d.bytes))+" · "+d.ndest+' destinations</title></circle>';
-    // Direct-label only the four biggest devices: past that the labels crowd
-    // each other in narrow sectors. Every device is still named in the legend
-    // and on hover, so identity is never carried by colour alone.
-    if(di<4){
-      const k=1-(0.19+(di%2)*0.17);
-      const lx=cx+Math.cos(mid)*r1x*k, ly=cy+Math.sin(mid)*r1y*k;
-      labels+='<text x="'+lx.toFixed(1)+'" y="'+ly.toFixed(1)+
-        '" text-anchor="middle" style="font-size:10px;font-weight:600">'+
-        esc(shortLabel(d.name,14))+"</text>";
-    }
+    // the device itself: labelled, sized, and the thing you click
+    inner+='<circle cx="'+dx.toFixed(1)+'" cy="'+dy.toFixed(1)+'" r="8" fill="'+col+
+      '" stroke="var(--surface-1)" stroke-width="2.5"/>';
+    if(bad)inner+='<circle cx="'+(dx+7).toFixed(1)+'" cy="'+(dy-7).toFixed(1)+
+      '" r="3.4" fill="#d03b3b" stroke="var(--surface-1)" stroke-width="1.5"/>';
+    const flip=Math.cos(mid)<0;
+    const lx=dx+(flip?-13:13), anchor=flip?"end":"start";
+    inner+='<text x="'+lx.toFixed(1)+'" y="'+(dy-1).toFixed(1)+'" text-anchor="'+anchor+
+      '" style="font-size:11.5px;font-weight:600">'+esc(shortLabel(d.name,20))+"</text>"+
+      '<text class="mut" x="'+lx.toFixed(1)+'" y="'+(dy+11).toFixed(1)+'" text-anchor="'+
+      anchor+'" style="font-size:9.5px">'+d.ndest+" dest"+(d.ndest===1?"":"s")+
+      " · "+esc(fmtBytes(d.bytes))+"</text>";
+    // A generous transparent disc over the device makes the whole cluster head
+    // clickable. fill="transparent" is hit-tested; fill="none" is not, so an
+    // 8px dot was the only real target before this.
+    inner+='<circle class="chit" cx="'+dx.toFixed(1)+'" cy="'+dy.toFixed(1)+
+      '" r="26" fill="transparent"/>';
+    groups+='<g class="cdev" data-focus="'+esc(d.ip)+'"><title>'+esc(d.name)+"\n"+
+      d.ndest+" destinations · "+esc(fmtBytes(d.bytes))+
+      "\nclick to open this device</title>"+inner+"</g>";
     a0+=span;
   }
-  // The white dot is home; it gets no text label because device labels sit just
-  // inside the ring and a centre label collides with whichever one points at it.
-  nodes+='<circle cx="'+cx+'" cy="'+cy+'" r="7" fill="var(--home)"><title>your LAN</title></circle>';
-  const legend=devs.map(d=>'<span><i style="background:'+colorFor(d.ip)+'"></i>'+
-    esc(shortLabel(d.name,18))+"</span>").join("");
+  groups+='<circle cx="'+cx+'" cy="'+cy+'" r="7" fill="var(--home)"><title>your LAN</title></circle>';
   return "<h4>Who talks to whom</h4>"+
-    '<div class="vfig">'+
-    '<svg class="vchart" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Device to destination link graph">'+
-    marks+nodes+labels+"</svg>"+
-    '<div class="vlegend">'+legend+"</div></div>"+
-    '<div class="vnote">Each spoke is a device; the dots around it are the destinations it '+
-    "reached. Line thickness and dot size are data volume. Red marks a destination on a "+
-    "threat list. Click a dot to open its details.</div>";
+    '<div class="vfig"><svg class="vchart cnst" viewBox="0 0 '+W+" "+H+
+    '" role="img" aria-label="Devices and the destinations they reach">'+groups+"</svg></div>"+
+    '<div class="vnote"><b>Click any device</b> to open its connections one per row, '+
+    "with hostnames and volumes. Hovering a device dims the rest. Dot size and line "+
+    "thickness are data volume; red is a destination on a threat list.</div>";
 }
 
+// Drill-down: one device, one connection per row. Nothing overlaps because
+// every row owns its own band of vertical space.
+function vizConstDetail(devs,byDev,W){
+  const dev=devs.find(d=>d.ip===vizFocus)||{ip:vizFocus,name:vizFocus,bytes:0};
+  const ls=(byDev.get(vizFocus)||[]).slice().sort((a,b)=>b.bytes-a.bytes);
+  const col=colorFor(dev.ip);
+  const rowH=26, padT=16, padB=10;
+  const H=Math.max(120,padT+ls.length*rowH+padB);
+  const nodeX=Math.min(150,W*0.22), labelX=nodeX+14;
+  const barW=Math.min(150,W*0.16), barX=W-barW-96;
+  const dy=padT+(ls.length*rowH)/2-rowH/2;
+  const maxB=Math.max(...ls.map(l=>l.bytes),1);
+  let s='<line x1="'+(nodeX-40)+'" y1="'+dy+'" x2="'+nodeX+'" y2="'+dy+
+    '" stroke="'+col+'" stroke-width="2" opacity=".6"/>'+
+    '<circle cx="'+(nodeX-40)+'" cy="'+dy+'" r="6" fill="var(--home)"/>';
+  ls.forEach((l,i)=>{
+    const y=padT+i*rowH+rowH/2;
+    const lc=l.threat?"#d03b3b":col;
+    s+='<path d="M'+nodeX+','+dy+' C'+(nodeX+34)+','+dy+' '+(labelX-14)+','+y+' '+
+      (labelX-2)+','+y+'" fill="none" stroke="'+lc+'" stroke-width="'+
+      Math.max(1,Math.min(1+Math.log2(1+l.bytes/1024)*0.36,5)).toFixed(2)+'" opacity=".55"/>';
+    const w=Math.max(2,(l.bytes/maxB)*barW);
+    const flag=l.cc?flag2(l.cc)+" ":"";
+    s+='<g class="crow" data-ip="'+esc(l.ip||"")+'" data-dev="'+esc(l.dev)+'">'+
+      '<rect x="0" y="'+(y-rowH/2+1)+'" width="'+W+'" height="'+(rowH-2)+
+      '" rx="5" fill="transparent" class="crowbg"/>'+
+      '<circle cx="'+labelX+'" cy="'+y+'" r="4" fill="'+lc+'"/>'+
+      '<text x="'+(labelX+11)+'" y="'+(y+4)+'" style="font-size:12px"'+
+      (l.threat?' fill="#e2564f" font-weight="600"':"")+'>'+
+      esc(flag+shortLabel(l.node,42))+(l.threat?"  ⚠ flagged":"")+"</text>"+
+      '<rect x="'+barX+'" y="'+(y-4)+'" width="'+barW+'" height="8" rx="4" '+
+      'fill="var(--surface-3)"/>'+
+      '<rect x="'+barX+'" y="'+(y-4)+'" width="'+w.toFixed(1)+'" height="8" rx="4" fill="'+lc+'"/>'+
+      '<text class="mut" x="'+(W-8)+'" y="'+(y+4)+'" text-anchor="end" '+
+      'style="font-size:11px;font-variant-numeric:tabular-nums">'+esc(fmtBytes(l.bytes))+"</text>"+
+      "<title>"+esc(l.node)+(l.ip&&l.ip!==l.node?"\n"+esc(l.ip):"")+
+      (l.nip>1?" (+"+(l.nip-1)+" more IPs)":"")+"\n"+esc(fmtBytes(l.bytes))+
+      "  ↑"+esc(fmtBytes(l.up))+" ↓"+esc(fmtBytes(l.down))+
+      (l.country?"\n"+esc(l.country):"")+(l.threat?"\nON THREAT LIST":"")+
+      (l.ip?"\n\nclick for full details":"")+"</title></g>";
+  });
+  const bad=ls.filter(l=>l.threat).length;
+  return '<div class="cbar"><button class="cback">&#8592; all devices</button>'+
+    '<span class="csw" style="background:'+col+'"></span>'+
+    "<b>"+esc(dev.name)+"</b><span class=\"cmeta\">"+ls.length+" destination"+
+    (ls.length===1?"":"s")+" · "+esc(fmtBytes(dev.bytes))+
+    (bad?' · <span style="color:var(--bad)">'+bad+" flagged</span>":"")+"</span></div>"+
+    '<svg class="vchart cdet" viewBox="0 0 '+W+" "+H+'" role="img" aria-label="Connections for '+
+    esc(dev.name)+'">'+s+"</svg>"+
+    '<div class="vnote">One row per destination, ordered by volume. Click a row for '+
+    "geolocation, blocklist status, history and every alert about it.</div>";
+}
+// two-letter country code -> flag emoji, guarding against junk codes
+function flag2(cc){ return flag(cc)||""; }
 // --- Flow: a two-column Sankey of bytes, device -> country.
 function vizFlow(f,W){
   const devs=(f&&f.devices||[]).filter(d=>d.bytes>0);
@@ -4691,6 +4772,10 @@ document.addEventListener("keydown",e=>{
   if(detailPanel.classList.contains("open"))closeDetail();
   else if(digestPanel.classList.contains("open"))digestPanel.classList.remove("open");
   else if(alertsPanel.classList.contains("open"))alertsPanel.classList.remove("open");
+  // step out of a constellation drill-down before touching the dock itself
+  else if(vizFocus&&vizPanel.classList.contains("open")&&vizView==="constellation"){
+    vizFocus=null; renderViz();
+  }
   else if(vizPanel.classList.contains("max"))vizSet("dock");
   else if(vizPanel.classList.contains("open"))vizSet("off");
 });

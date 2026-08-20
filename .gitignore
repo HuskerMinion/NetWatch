@@ -19,3 +19,7 @@ netwatch_names.json
 # Your destination notes are personal too — keep the .example, not this
 netwatch_notes.json
 netwatch_notes.json.tmp
+
+# Scratch folder for the git lock/tmp files the Cowork device bridge creates
+# but cannot unlink. Never belongs in the repo; safe to delete on sight.
+_git_stale/
