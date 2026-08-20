@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.20.10"  # date + same-day build number, so successive changes on
+VERSION = "2026.08.20.12"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -1363,6 +1363,12 @@ def db_init():
         first REAL, last REAL, up INTEGER, down INTEGER, threat TEXT)""")
     con.execute("CREATE INDEX IF NOT EXISTS ix_sess_last ON sessions(last)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_sess_dev ON sessions(dev)")
+    # NOTE: ix_sess_key (dev, rem, first) is deliberately NOT created here — see
+    # db_index_worker(). Building it over a large existing sessions table takes
+    # minutes on a Pi, and db_init() runs BEFORE the web server binds its port,
+    # so doing it here made the dashboard unreachable for the whole build on the
+    # first start after an upgrade. It is an optimisation, not a correctness
+    # requirement, so it is built in the background instead.
     con.execute("""CREATE TABLE IF NOT EXISTS seen(
         kind TEXT, a TEXT, b TEXT, first REAL, PRIMARY KEY(kind,a,b))""")
     con.execute("""CREATE TABLE IF NOT EXISTS alerts(
@@ -1660,12 +1666,59 @@ def db_worker():
                 # NOTE: dns_targets is deliberately NOT pruned — it's the cumulative
                 # firewall/ACL blocklist and must be a permanent record, not a
                 # rolling 30-day window (it's tiny: one row per distinct resolver).
+                # Without stats SQLite guesses at selectivity and can pick a
+                # whole-table scan over a window index. analysis_limit caps how
+                # many rows each index is sampled on: an unbounded ANALYZE reads
+                # the whole table (hundreds of ms on a container SSD, tens of
+                # seconds on a Pi) and this runs every hour, forever.
+                try:
+                    con.execute("PRAGMA analysis_limit=400")
+                    con.execute("ANALYZE")
+                except Exception:
+                    pass
                 last_prune = now
             con.commit()
         except Exception as e:
             print("  history write error: %s" % e)
         try:
             viz_warm()      # keep recently-viewed /viz windows hot
+        except Exception:
+            pass
+
+
+def db_index_worker():
+    """Build the optional performance index in the background.
+
+    db_worker rewrites every live flow's row every DB_FLUSH_EVERY seconds with
+    DELETE + INSERT keyed on (dev, rem, first); without an index that DELETE is
+    a table scan. With a large existing database the build takes minutes, so it
+    happens here — after the HTTP server is up — rather than blocking startup.
+    Everything works without it; it just works harder."""
+    time.sleep(20)                       # let capture and the UI settle first
+    try:
+        con = db_connect()
+    except Exception:
+        return
+    try:
+        have = {r[1] for r in con.execute("PRAGMA index_list(sessions)")}
+        if "ix_sess_key" in have:
+            return
+        n = con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        if n > 200000:
+            print("  building the sessions index over %d rows in the background; "
+                  "the dashboard stays up, writes may be slow for a minute" % n)
+        t0 = time.time()
+        con.execute("CREATE INDEX IF NOT EXISTS ix_sess_key "
+                    "ON sessions(dev, rem, first)")
+        con.commit()
+        if n > 200000:
+            print("  sessions index built in %.1fs" % (time.time() - t0))
+    except Exception as e:
+        print("  could not build the sessions index (%s); NetWatch works "
+              "without it, writes are just slower" % e)
+    finally:
+        try:
+            con.close()
         except Exception:
             pass
 
@@ -2444,27 +2497,39 @@ def viz_data(hours=24):
         names = {}
         for dev, nm in con.execute(
                 "SELECT dev, MAX(COALESCE(dev_name,'')) FROM sessions "
-                "WHERE last >= ? GROUP BY dev", (since,)):
+                "INDEXED BY ix_sess_last WHERE last >= ? GROUP BY dev", (since,)):
             names[dev] = nm or ""
 
         # ---- constellation: top devices, each with its top destinations ------
         devs = []
         for dev, tot, ndest in con.execute(
                 "SELECT dev, SUM(up+down), COUNT(DISTINCT rem) FROM sessions "
-                "WHERE last >= ? GROUP BY dev ORDER BY 2 DESC LIMIT 10", (since,)):
+                "INDEXED BY ix_sess_last WHERE last >= ? GROUP BY dev "
+                "ORDER BY 2 DESC LIMIT 10", (since,)):
             devs.append({"ip": dev, "name": names.get(dev) or dev,
                          "bytes": tot or 0, "ndest": ndest or 0})
         out["constellation"]["devices"] = devs
         keep = {d["ip"] for d in devs}
         per_dev = {}
+        # INDEXED BY: for a 24h window over a 30-day table only a few percent of
+        # rows qualify, but SQLite prefers ix_sess_dev to avoid a sort and ends
+        # up scanning everything. Forcing the time index makes the cost scale
+        # with the window you asked for instead of with all of history.
+        # The dev filter is applied in SQL rather than in Python for the same
+        # reason — no point grouping rows the overview will throw away.
+        keep_q = ""
+        args = [since]
+        if keep:
+            keep_q = " AND dev IN (%s)" % ",".join("?" * len(keep))
+            args.extend(sorted(keep))
         for (dev, node, b, up, down, cc, threat, host, ip, nip, last, country
              ) in con.execute(
                 "SELECT dev, COALESCE(NULLIF(host,''), rem) AS node, "
                 "SUM(up+down) AS b, SUM(up), SUM(down), MAX(COALESCE(cc,'')), "
                 "MAX(COALESCE(threat,'')), MAX(COALESCE(host,'')), MAX(rem), "
                 "COUNT(DISTINCT rem), MAX(last), MAX(COALESCE(country,'')) "
-                "FROM sessions WHERE last >= ? "
-                "GROUP BY dev, node ORDER BY b DESC", (since,)):
+                "FROM sessions INDEXED BY ix_sess_last WHERE last >= ?" + keep_q +
+                " GROUP BY dev, node ORDER BY b DESC", args):
             if dev not in keep:
                 continue
             lst = per_dev.setdefault(dev, [])
@@ -2483,7 +2548,8 @@ def viz_data(hours=24):
         # ---- flow: device -> country, bytes -------------------------------
         pairs = con.execute(
             "SELECT dev, COALESCE(NULLIF(country,''),'Unknown'), SUM(up+down) "
-            "FROM sessions WHERE last >= ? GROUP BY 1,2", (since,)).fetchall()
+            "FROM sessions INDEXED BY ix_sess_last WHERE last >= ? "
+            "GROUP BY 1,2", (since,)).fetchall()
         dev_tot, cc_tot = {}, {}
         for dev, country, b in pairs:
             dev_tot[dev] = dev_tot.get(dev, 0) + (b or 0)
@@ -2523,7 +2589,8 @@ def viz_data(hours=24):
                 by_hour[h] = [b or 0, nd or 0, 0, 0]
         for h, n in con.execute(
                 "SELECT CAST(last/3600 AS INTEGER) h, COUNT(DISTINCT dev) "
-                "FROM sessions WHERE last >= ? GROUP BY h", (since,)):
+                "FROM sessions INDEXED BY ix_sess_last WHERE last >= ? "
+                "GROUP BY h", (since,)):
             by_hour.setdefault(h, [0, 0, 0, 0])[2] = n or 0
         for h, n in con.execute(
                 "SELECT CAST(ts/3600 AS INTEGER) h, COUNT(*) FROM alerts "
@@ -2590,17 +2657,33 @@ _viz_building = set()
 
 
 VIZ_WARM_FOR = 1800       # keep a window rebuilt this long after its last use
+VIZ_DEFAULT_HOURS = 24    # the window the dock opens on
+VIZ_DEFAULT_TTL = 300     # ...kept permanently warm, refreshed no faster than this
 
 
 def viz_warm():
-    """Refresh any window someone has looked at recently, so the next device to
-    open the panel gets an instant answer instead of paying for the query."""
+    """Keep windows hot so opening the dock is instant.
+
+    Two rules. Any window someone looked at in the last VIZ_WARM_FOR seconds is
+    refreshed on the normal TTL. The DEFAULT window is refreshed forever on a
+    slower cadence, whether or not anyone has looked at it — that is the one the
+    dock opens on, and it was the case that hurt: come back after a few hours
+    and it had gone cold, so the first click paid the full query cost with the
+    user sat watching."""
     now = time.time()
     with _viz_lock:
-        due = [h for h, e in VIZ_CACHE.items()
-               if now - e["ts"] >= VIZ_TTL
-               and now - e.get("last_get", 0) < VIZ_WARM_FOR
-               and h not in _viz_building]
+        due = []
+        for h, e in VIZ_CACHE.items():
+            if h in _viz_building:
+                continue
+            age = now - e["ts"]
+            recent = now - e.get("last_get", 0) < VIZ_WARM_FOR
+            if age >= (VIZ_TTL if recent else VIZ_DEFAULT_TTL) and (
+                    recent or h == VIZ_DEFAULT_HOURS):
+                due.append(h)
+        if (VIZ_DEFAULT_HOURS not in VIZ_CACHE
+                and VIZ_DEFAULT_HOURS not in _viz_building):
+            due.append(VIZ_DEFAULT_HOURS)      # build it once, then keep it
         for h in due:
             _viz_building.add(h)
     for h in due:
@@ -3288,6 +3371,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .nm-dot .core{position:absolute;inset:0;border-radius:50%;background:var(--series-1);border:2px solid var(--surface-1)}
   .nm-dot .ring{position:absolute;inset:0;border-radius:50%;border:2px solid var(--series-1);opacity:0}
   .nm-dot.active .ring{animation:pulse 1.9s ease-out infinite}
+  /* An animation budget, because these are per-marker and per-arc: on a busy
+     network there can be hundreds, and stroke-dashoffset in particular cannot
+     be composited - it repaints the whole SVG overlay every frame. Above the
+     budget the marks are still drawn, just not animated. */
+  .nomotion .nm-dot .ring,.nm-dot.still .ring{animation:none!important;opacity:0!important}
+  .nomotion path.nm-arc{animation:none!important;stroke-dasharray:none!important}
+  @media (prefers-reduced-motion: reduce){
+    .nm-dot .ring{animation:none!important;opacity:0!important}
+    path.nm-arc{animation:none!important;stroke-dasharray:none!important}
+    .logo .lblip{animation:none!important}
+    #viz #vizBody{transition:none!important}
+  }
   .nm-dot.home .core{background:var(--home);border-color:#0008;border-radius:3px}
   .nm-dot.home .ring{border-color:var(--home);border-radius:3px;animation:pulse 2.5s ease-out infinite}
   @keyframes pulse{0%{opacity:.8;transform:scale(1)}100%{opacity:0;transform:scale(3)}}
@@ -3413,16 +3508,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #viz{position:absolute;left:0;right:0;bottom:0;z-index:900;
     display:flex;flex-direction:column;pointer-events:none}
   #vizBody{height:0;overflow:auto;flex:none;padding:0 14px;pointer-events:auto;
-    background:linear-gradient(180deg,rgba(40,44,50,.93),rgba(33,36,41,.98));
-    backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);
+    background:linear-gradient(180deg,rgba(40,44,50,.985),rgb(33,36,41));
     border-top:1px solid transparent;
     transition:height .22s cubic-bezier(.4,0,.2,1),padding .22s ease,border-color .22s ease}
   #viz.open #vizBody{padding:10px 14px 14px;border-top-color:var(--border);
     box-shadow:0 -10px 30px rgba(0,0,0,.45)}
   .vbar{display:flex;align-items:stretch;padding:0;flex:none;
     pointer-events:auto;border-top:1px solid var(--border);
-    background:linear-gradient(180deg,rgba(46,51,58,.90),rgba(36,40,46,.96));
-    backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2)}
+    background:linear-gradient(180deg,rgb(46,51,58),rgb(36,40,46))}
   /* the controls are meaningless with nothing open */
   #viz:not(.open) .vctl{display:none}
   .vctl{position:absolute;top:9px;right:14px;z-index:3;display:flex;align-items:center;
@@ -3631,6 +3724,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="tile inbound jump" id="tileInbound"
         title="Unsolicited inbound sources seen recently — click to jump to the list">
         <b id="tInbound">–</b><small>inbound</small></div>
+      <button id="motionBtn" class="hbtn" title="Toggle map animation (saves GPU on weaker machines)">&#9678; motion</button>
       <button id="digestBtn" class="hbtn" title="Show a summary">&#9776; digest</button>
       <button id="alertBtn" class="hbtn" title="Show alerts">&#9873; alerts<span class="n" id="alertN" style="display:none">0</span></button>
       <button id="quitBtn" title="Stop NetWatch">&#10005; quit</button>
@@ -3728,6 +3822,17 @@ if(HAS_MAP){
   '<div class="empty" style="padding-top:15vh">Map library could not load (check cdnjs.cloudflare.com).<br>The device &amp; destination lists still work.</div>';}
 
 const BLUE=PALETTE[0];
+// How many markers/arcs may animate at once. Each animated arc repaints the SVG
+// overlay every frame (stroke-dashoffset cannot be composited) and each pulsing
+// ring is its own compositing layer, so on a busy network the uncapped version
+// pegged the GPU. Override with ?anim=N, or turn motion off entirely with the
+// header toggle / ?anim=0.
+const ANIM_PARAM=new URLSearchParams(location.search).get("anim");
+const ANIM_BUDGET=ANIM_PARAM!==null?Math.max(0,+ANIM_PARAM||0):24;
+let NOMOTION=false;
+try{ NOMOTION = localStorage.getItem("nw-motion")==="off" || ANIM_BUDGET===0; }catch(e){}
+if(window.matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches) NOMOTION=true;
+document.documentElement.classList.toggle("nomotion",NOMOTION);
 let homeMarker=null,homeLL=null,latest=null,selDev=null;
 const layers=new Map();          // rem_ip -> {marker,arc}
 const devColor=new Map();        // dev_ip -> hex
@@ -3852,6 +3957,10 @@ function render(d){
       map.setView(homeLL,3);
     }
     const seen=new Set();
+    // Animation budget. d.dests arrives sorted with threats and the busiest
+    // first, so the marks that keep their animation are the ones worth looking
+    // at. Everything past the budget still renders, just static.
+    let animLeft = ANIM_BUDGET;
     for(const x of d.dests){
       if(!x.geo) continue;
       const la=+x.geo.lat, lo=+x.geo.lon;
@@ -3862,7 +3971,9 @@ function render(d){
         const ll=[la,lo];
         const bad=!!x.threat;
         const color=bad?"#d03b3b":(selDev?colorFor(selDev):(x.devices.length===1?colorFor(x.devices[0]):BLUE));
-        const cls=(x.active?"active":"")+(bad?" bad":"");
+        const animate = (x.active||bad) && animLeft>0 && !NOMOTION;
+        if(animate) animLeft--;
+        const cls=(x.active?"active":"")+(bad?" bad":"")+(animate?"":" still");
         const size=Math.min(9+Math.log2(1+(x.up+x.down)/500)*2.0,24);
         // Bandwidth arc: thickness carries volume, so a 900 KB upload no longer
         // looks identical to a 40-byte keepalive. Log-scaled — a home network
@@ -3875,12 +3986,12 @@ function render(d){
             .bindTooltip(destTip(x),{className:"nm",direction:"top",offset:[0,-8],sticky:true});
           let arc=null;
           if(homeLL) arc=L.polyline(arcPoints(homeLL,ll),{color:color,weight:aw,
-            opacity:ao,className:x.active?"nm-arc":"",interactive:false}).addTo(map);
+            opacity:ao,className:animate?"nm-arc":"",interactive:false}).addTo(map);
           e={marker,arc};layers.set(x.ip,e);
         }else{
           e.marker.setIcon(dotIcon(cls,size,color));
           e.marker.setTooltipContent(destTip(x));
-          if(e.arc) e.arc.setStyle({color:color,weight:aw,opacity:ao,className:x.active?"nm-arc":""});
+          if(e.arc) e.arc.setStyle({color:color,weight:aw,opacity:ao,className:animate?"nm-arc":""});
         }
         e.marker.setOpacity(x.active||bad?1:.4);
       }catch(err){/* skip a single problematic marker, keep going */}
@@ -4264,6 +4375,26 @@ function fallbackCopy(text,done,btn){
   catch(e){ btn.textContent="Select the list & copy"; }
   document.body.removeChild(ta);
 }
+// Motion toggle. Animated arcs and pulsing rings are the page's whole GPU cost;
+// on weaker hardware turning them off is the difference between a warm laptop
+// and a quiet one. Remembered per browser.
+(function(){
+  const b=document.getElementById("motionBtn");
+  function paint(){
+    b.classList.toggle("on",!NOMOTION);
+    b.title=NOMOTION?"Map animation off - click to enable"
+                    :"Map animation on - click to disable (saves GPU)";
+  }
+  paint();
+  b.addEventListener("click",()=>{
+    NOMOTION=!NOMOTION;
+    try{ localStorage.setItem("nw-motion",NOMOTION?"off":"on"); }catch(e){}
+    document.documentElement.classList.toggle("nomotion",NOMOTION);
+    paint();
+    wipeLayers();               // rebuild markers so the budget is re-applied
+    if(latest) render(latest);
+  });
+})();
 document.getElementById("digestBtn").addEventListener("click",()=>{
   const opening=!digestPanel.classList.contains("open");
   digestPanel.classList.toggle("open");
@@ -5019,6 +5150,7 @@ def main():
     threading.Thread(target=threat_worker, name="threat", daemon=True).start()
     threading.Thread(target=oui_worker, name="oui", daemon=True).start()
     threading.Thread(target=db_worker, name="db", daemon=True).start()
+    threading.Thread(target=db_index_worker, name="dbindex", daemon=True).start()
     threading.Thread(target=seen_writer, name="seen", daemon=True).start()
     threading.Thread(target=alert_worker, name="alert", daemon=True).start()
     threading.Thread(target=notify_worker, name="notify", daemon=True).start()

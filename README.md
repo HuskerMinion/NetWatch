@@ -327,7 +327,41 @@ brown. Watch the arcs as you go — that is the thing being traded away. The fil
 is scoped to the tile layer, so markers, arcs and tooltips keep their true colours
 whatever you set.
 
-### 13. Process names for a specific PC (optional)
+### 13. Performance on modest hardware
+
+Two knobs, because a Pi serving a busy network and a laptop rendering the map
+have very different problems.
+
+**The map's GPU cost.** Animated connection arcs and pulsing markers are the
+page's entire GPU load: `stroke-dashoffset` cannot be composited, so every
+animated arc repaints the whole SVG overlay each frame, and each pulsing ring is
+its own compositing layer. NetWatch animates only the **24 most interesting**
+marks (threats and the busiest destinations first) and draws the rest static — you
+still see everything, it just isn't moving. Adjust or disable:
+
+| | |
+|---|---|
+| **motion** button in the header | toggles animation off/on, remembered per browser |
+| `?anim=0` | open the dashboard with animation off |
+| `?anim=60` | raise the budget on a strong machine |
+| `prefers-reduced-motion` | honoured automatically — no animation at all |
+
+**First start after upgrading.** NetWatch builds one optional index over the
+`sessions` table. On a long-running install that can take a minute or two, so it
+happens in the **background, after the dashboard is already serving** — the log
+says so while it runs. Everything works without the index; writes are just
+slower until it lands.
+
+**Query speed.** The four views aggregate the `sessions` table. On a long-running
+install that table gets large, and the visible symptom was clicking *Constellation*
+and waiting. Three things address it: the queries force the time index so cost
+scales with the window you asked for rather than all 30 days of history; results
+are cached per window and served stale-while-revalidating; and the default 24-hour
+window is kept permanently warm in the background, so the common click is instant
+even after the dashboard has sat idle for hours. Longer windows (7d, 30d) are
+genuinely more work — the first open of one pays for it, then it is cached.
+
+### 14. Process names for a specific PC (optional)
 
 A mirrored port sees every device but can never see which *program* opened a socket
 — that only exists on the machine itself. To close that gap on machines you care
