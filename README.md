@@ -335,6 +335,20 @@ about:
 
 1. Set a long random `agent_token` in `netwatch.conf` and restart NetWatch.
    (While it's empty — the default — the `/agent` endpoint refuses everything.)
+
+   Two things to know. The file must sit **next to the running script** — the
+   ExecStart path, normally `/opt/netwatch/netwatch.conf`, not a copy in your
+   repo folder. And a single stray comma makes the whole file unparseable, which
+   silently disables *every* setting in it, not just this one. So validate
+   before restarting:
+
+   ```bash
+   python3 -m json.tool /opt/netwatch/netwatch.conf && sudo systemctl restart netwatch
+   ```
+
+   The startup log then tells you where you stand, in `journalctl -u netwatch`:
+   `agent endpoint: ENABLED (token loaded, 32 chars)` — or `disabled`, or a
+   `config ERROR` naming the line that broke.
 2. Copy `netwatch_agent.py` to the PC and run it:
 
 ```bash

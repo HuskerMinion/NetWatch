@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.20.7"  # date + same-day build number, so successive changes on
+VERSION = "2026.08.20.9"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -1137,9 +1137,15 @@ def load_config():
             cfg = json.load(f)
         print("  loaded config from %s" % CONF_FILE)
     except FileNotFoundError:
-        pass
+        # Say so out loud. A config file sitting in the wrong directory looks
+        # exactly like no config file at all, and silence made that a guessing
+        # game — NetWatch reads netwatch.conf from ITS OWN directory.
+        print("  no config file at %s (using defaults)" % CONF_FILE)
     except Exception as e:
-        print("  config error (%s); using defaults" % e)
+        print("  config ERROR in %s: %s" % (CONF_FILE, e))
+        print("  ...the file was found but could not be parsed, so EVERY "
+              "setting in it is being ignored. Check it with: "
+              "python3 -m json.tool %s" % CONF_FILE)
     CONF = cfg
     PIHOLE_IPS = set(cfg.get("pihole_ips", []))
     IGNORE = set(cfg.get("ignore_devices", []))
@@ -1658,6 +1664,10 @@ def db_worker():
             con.commit()
         except Exception as e:
             print("  history write error: %s" % e)
+        try:
+            viz_warm()      # keep recently-viewed /viz windows hot
+        except Exception:
+            pass
 
 
 def db_history(since, dev=None, limit=500):
@@ -2558,6 +2568,90 @@ def viz_data(hours=24):
     return out
 
 
+# --- /viz result cache -------------------------------------------------------
+# viz_data() is several GROUP BYs over the sessions table; at a 30-day window on
+# a Pi that is real work, and it was being redone for every request from every
+# browser, tab and phone. Cache the serialized bytes per window and serve a
+# slightly stale copy instantly while refreshing behind it, the same trick
+# SNAP_CACHE uses for /data.
+VIZ_CACHE = {}            # hours -> {"bytes": b, "ts": t}
+VIZ_TTL = 45              # serve without question for this long
+VIZ_STALE_OK = 900        # beyond fresh, still worth serving while we rebuild
+VIZ_CACHE_MAX = 8         # only a handful of window sizes exist in the UI
+_viz_lock = threading.Lock()
+_viz_building = set()
+
+
+VIZ_WARM_FOR = 1800       # keep a window rebuilt this long after its last use
+
+
+def viz_warm():
+    """Refresh any window someone has looked at recently, so the next device to
+    open the panel gets an instant answer instead of paying for the query."""
+    now = time.time()
+    with _viz_lock:
+        due = [h for h, e in VIZ_CACHE.items()
+               if now - e["ts"] >= VIZ_TTL
+               and now - e.get("last_get", 0) < VIZ_WARM_FOR
+               and h not in _viz_building]
+        for h in due:
+            _viz_building.add(h)
+    for h in due:
+        try:
+            _viz_build(h)
+        except Exception:
+            pass
+
+
+def _viz_build(hours):
+    """Compute one window and install it in the cache. Returns the bytes."""
+    try:
+        b = json.dumps(viz_data(hours)).encode("utf-8")
+    finally:
+        with _viz_lock:
+            _viz_building.discard(hours)
+    with _viz_lock:
+        prev = VIZ_CACHE.get(hours) or {}
+        VIZ_CACHE[hours] = {"bytes": b, "ts": time.time(),
+                            "last_get": prev.get("last_get", time.time())}
+        while len(VIZ_CACHE) > VIZ_CACHE_MAX:
+            del VIZ_CACHE[min(VIZ_CACHE, key=lambda k: VIZ_CACHE[k]["ts"])]
+    return b
+
+
+def viz_cached(hours):
+    """Bytes for /viz. Fresh -> instant. Stale -> instant, refreshed behind.
+    Cold -> compute now (and any other request for the same window waits on
+    that one build rather than starting a second)."""
+    now = time.time()
+    with _viz_lock:
+        e = VIZ_CACHE.get(hours)
+        if e:
+            e["last_get"] = now       # marks the window as "in use" for warming
+        age = (now - e["ts"]) if e else None
+        mine = False
+        if (age is None or age >= VIZ_TTL) and hours not in _viz_building:
+            _viz_building.add(hours)
+            mine = True
+    if e and age < VIZ_TTL:
+        return e["bytes"]
+    if e and age < VIZ_STALE_OK:
+        if mine:                      # hand the rebuild to a worker, serve stale
+            threading.Thread(target=_viz_build, args=(hours,),
+                             name="viz", daemon=True).start()
+        return e["bytes"]
+    if mine:
+        return _viz_build(hours)
+    for _ in range(150):              # someone else is already building it
+        time.sleep(0.1)
+        with _viz_lock:
+            e = VIZ_CACHE.get(hours)
+        if e:
+            return e["bytes"]
+    return json.dumps({"hours": hours,
+                       "error": "still building, try again"}).encode("utf-8")
+
+
 def build_digest():
     d = digest_data(DIGEST_INTERVAL // 86400)
     L = ["NetWatch weekly digest", "=" * 40, ""]
@@ -2964,7 +3058,7 @@ class Handler(BaseHTTPRequestHandler):
                                    int(float(q.get("hours", ["24"])[0]))))
             except ValueError:
                 hours = 24
-            body = json.dumps(viz_data(hours)).encode("utf-8")
+            body = viz_cached(hours)
             ctype = "application/json"
         else:
             self.send_response(404); self.end_headers(); return
@@ -3366,6 +3460,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .vlegend span{display:inline-flex;align-items:center;gap:5px}
   .vlegend i{width:9px;height:9px;border-radius:2px;display:inline-block}
   .vempty{color:var(--text-muted);text-align:center;padding:34px 10px;font-size:12px}
+  .vretry{background:var(--surface-3);border:1px solid var(--border);color:var(--text-secondary);
+    border-radius:7px;padding:6px 16px;font:inherit;font-size:11px;cursor:pointer}
+  .vretry:hover{border-color:var(--accent);color:var(--text-primary)}
   svg.vchart{width:100%;display:block;overflow:visible}
   svg.vchart text{fill:var(--text-secondary);font:11px "Segoe UI",system-ui,sans-serif;
     paint-order:stroke;stroke:var(--surface-2);stroke-width:3px;stroke-linejoin:round}
@@ -4158,7 +4255,7 @@ document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",
 // device has on the map (colorFor), so identity carries across every view — a
 // filter or a re-sort never repaints a device.
 const vizPanel=document.getElementById("viz");
-let vizView="constellation", vizHours=24, vizData=null, vizBusy=false;
+let vizView="constellation", vizHours=24, vizData=null, vizBusy=false, vizErr="";
 
 // sequential ramp: one hue (the series-1 blue), dim -> bright against the dark
 // surface. Magnitude is lightness, never a second hue.
@@ -4175,21 +4272,41 @@ function dayLabel(ts){const d=new Date(ts*1000);
   return (d.getMonth()+1)+"/"+d.getDate();}
 
 async function loadViz(){
-  if(vizBusy)return; vizBusy=true;
-  const body=document.getElementById("vizBody");
-  if(!vizData)body.innerHTML='<div class="vempty">Loading&hellip;</div>';
+  if(vizBusy)return;
+  vizBusy=true; vizErr="";
+  renderViz();                       // paint the loading state, not an error
   try{
     const r=await fetch("/viz?hours="+vizHours,{cache:"no-store"});
+    if(!r.ok)throw new Error("server said HTTP "+r.status);
     vizData=await r.json();
-  }catch(e){ vizData=null; }
+  }catch(e){
+    // Keep whatever we last had on screen rather than throwing it away — a
+    // failed refresh should not blank a working view.
+    vizErr=String((e&&e.message)||e);
+  }
   vizBusy=false;
   renderViz();
 }
 function renderViz(){
   const body=document.getElementById("vizBody");
   const stamp=document.getElementById("vizStamp");
-  if(!vizData){ body.innerHTML='<div class="vempty">Could not load visualization data.</div>'; return; }
-  stamp.textContent=vizData.generated?("updated "+ago(vizData.generated)):"";
+  if(!vizData){
+    // "Not arrived yet" and "failed" are different things. The dock's height
+    // transition fires renderViz ~220ms after opening, which on a phone or a
+    // busy Pi beats the fetch — showing an error there was simply wrong.
+    body.classList.remove("fit");
+    body.innerHTML=vizBusy
+      ? '<div class="vempty">Loading&hellip;</div>'
+      : '<div class="vempty">Could not load visualization data.'
+        +(vizErr?'<br><small>'+esc(vizErr)+"</small>":"")
+        +'<br><br><button class="vretry">Retry</button></div>';
+    const rb=body.querySelector(".vretry");
+    if(rb)rb.addEventListener("click",loadViz);
+    stamp.textContent="";
+    return;
+  }
+  stamp.textContent=(vizData.generated?("updated "+ago(vizData.generated)):"")
+    +(vizErr?" · refresh failed":"");
   // Charts are drawn at the container's REAL pixel size, so the viewBox is 1:1
   // with the screen and 11px label text stays 11px. Scaling a fixed 580-wide
   // viewBox up to a 1200px dock would blow the type up with it.
@@ -4790,6 +4907,15 @@ def main():
         print("  Pi-hole IPs: %s" % ", ".join(sorted(PIHOLE_IPS)))
     if IGNORE:
         print("  ignoring devices: %s" % ", ".join(sorted(IGNORE)))
+    # State the agent endpoint's status at startup, so "agent_token not
+    # configured" can be diagnosed from the log instead of by guesswork.
+    if CONF.get("agent_token"):
+        print("  agent endpoint: ENABLED (token loaded, %d chars)"
+              % len(str(CONF["agent_token"])))
+    else:
+        print("  agent endpoint: disabled - no 'agent_token' in %s "
+              "(process attribution off; everything else works normally)"
+              % CONF_FILE)
     _load_cache()
     db_init()          # create the schema once up front, not per request
 

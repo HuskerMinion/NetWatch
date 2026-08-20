@@ -193,10 +193,17 @@ def collect_linux():
 # Windows: netstat -ano + tasklist
 # ---------------------------------------------------------------------------
 
+# On Windows, spawning netstat/tasklist normally flashes a console window each
+# time. That is invisible when you run the agent in a terminal, but running it
+# in the background (pythonw, Task Scheduler) would blink a window every cycle.
+_NO_WINDOW = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+              if sys.platform.startswith("win") else 0)
+
+
 def _run(cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=25,
-                              shell=False).stdout
+                              shell=False, creationflags=_NO_WINDOW).stdout
     except Exception:
         return ""
 
