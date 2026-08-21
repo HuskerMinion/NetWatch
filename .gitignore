@@ -16,9 +16,19 @@ netwatch.conf
 # Your device-name map is personal to your network — keep the .example, not this
 netwatch_names.json
 
+# The agent's settings hold your agent_token — never commit them
+netwatch_agent.conf
+netwatch_agent.conf.tmp
+
 # Your destination notes are personal too — keep the .example, not this
 netwatch_notes.json
 netwatch_notes.json.tmp
+
+# Installer scripts people write locally tend to have the agent_token baked in.
+# Keep them out of a public repo.
+NetWatchAgent.bat
+install*.bat
+*-agent.bat
 
 # Scratch folder for the git lock/tmp files the Cowork device bridge creates
 # but cannot unlink. Never belongs in the repo; safe to delete on sight.

@@ -395,6 +395,37 @@ Works on Linux (`/proc`), Windows (`netstat`/`tasklist`, no admin needed) and ma
 (`lsof`). That machine's destinations then show a ⚙ process name in the list, the
 map tooltip and the detail drawer. Every other device on the network is unaffected.
 
+**To leave it running permanently**, add `--install`:
+
+```bash
+python netwatch_agent.py --install --server 192.168.34.76 --token YOUR-TOKEN
+```
+
+That tests the connection *first* and only registers autostart if the report is
+accepted — a wrong token or unreachable server tells you immediately rather than
+silently doing nothing at every logon. It needs no administrator rights:
+
+| | |
+|---|---|
+| **Windows** | Scheduled Task "NetWatch Agent" at logon via `pythonw`, so no console window appears. Creating that task needs admin on many machines — if it is refused, the agent falls back automatically to the per-user Run key, which does not. `--status` reports which is in use |
+| **Linux** | systemd *user* service. To run it without being logged in: `sudo loginctl enable-linger $USER` |
+| **macOS** | LaunchAgent in `~/Library/LaunchAgents` |
+
+Settings are saved to `netwatch_agent.conf` beside the script (owner-only where
+the OS supports it), so the token isn't sitting on a command line visible in Task
+Scheduler or `ps`. Afterwards `--status` shows the settings, whether autostart is
+registered, and sends a test report; `--uninstall` removes autostart and keeps the
+settings.
+
+**Which machines are worth it?** The ones you'd actually investigate. The value
+isn't the process name by itself — it's what it does to alerts you already get: a
+threat-list hit becomes "*which binary* is talking to that address", a DNS-bypass
+alert tells you whether it's Chrome doing its default DoH or something you don't
+recognise, and a fingerprint deviation names the program that used a new port.
+NetWatch still sees every other device completely; those flows just stay anonymous.
+Note the agent polls every 15s, so a connection that opens and closes between polls
+is still seen by NetWatch but won't carry a process name.
+
 ---
 
 ## Responsible use
