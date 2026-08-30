@@ -23,6 +23,7 @@ netwatch_agent.conf.tmp
 # Your destination notes are personal too — keep the .example, not this
 netwatch_notes.json
 netwatch_notes.json.tmp
+netwatch-session-handoff.md
 
 # Installer scripts people write locally tend to have the agent_token baked in.
 # Keep them out of a public repo.
