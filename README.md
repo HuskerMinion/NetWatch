@@ -7,6 +7,7 @@ alerts, threat-intelligence flagging, history, and Pi-hole-bypass detection.**
 ![Platform](https://img.shields.io/badge/platform-Linux%20(Raspberry%20Pi)-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-none%20(stdlib)-brightgreen)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/huskerminion)
 
 NetWatch runs on a small always-on Linux box (a Raspberry Pi is ideal), watches a
 **mirrored switch port**, and maps the real outbound connections of *every* device
