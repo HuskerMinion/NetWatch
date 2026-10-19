@@ -9,6 +9,8 @@ netwatch.db-wal
 netwatch.db-shm
 netwatch_geo_cache.json
 netwatch_threat_cache.json
+netwatch_lan_state.json
+netwatch_lan_state.json.tmp
 
 # Your local config may contain notification credentials — never commit it
 netwatch.conf

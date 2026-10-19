@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.3"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.4"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -67,6 +67,8 @@ GEO_BATCH_URL = ("http://ip-api.com/batch?fields=status,message,country,"
 GEO_SELF_URL = ("http://ip-api.com/json/?fields=status,country,countryCode,"
                 "regionName,city,lat,lon,query")
 CACHE_FILE = os.path.join(HERE, "netwatch_geo_cache.json")
+LAN_STATE_FILE = os.path.join(HERE, "netwatch_lan_state.json")  # learned v6 prefixes
+                           # + ignored devices' MACs, so a restart starts right
 DB_FILE = os.path.join(HERE, "netwatch.db")
 CONF_FILE = os.path.join(HERE, "netwatch.conf")
 THREAT_CACHE = os.path.join(HERE, "netwatch_threat_cache.json")
@@ -1251,6 +1253,40 @@ def _save_cache():
             return          # never clobber a good cache with an empty one
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(ok, f)
+    except Exception:
+        pass
+    _save_lan_state()
+
+
+def _load_lan_state():
+    """Reload learned v6 prefixes and ignored devices' MACs. Without the MACs, a
+    Pi-hole's own v6 lookups look like a device bypassing DNS until its first
+    IPv4 frame arrives after a restart."""
+    try:
+        with open(LAN_STATE_FILE, "r", encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        return
+    for p in st.get("lan_v6", []):
+        try:
+            learn_v6_prefix(ipaddress.ip_network(p), "remembered")
+        except ValueError:
+            pass
+    for mac, dev in (st.get("ignore_mac") or {}).items():
+        if dev in IGNORE:                    # only while still ignored
+            IGNORE_MAC.setdefault(mac, dev)
+
+
+def _save_lan_state():
+    st = {"lan_v6": [str(n) for n in LAN_V6_NETS],
+          "ignore_mac": {m: d for m, d in list(IGNORE_MAC.items()) if d in IGNORE}}
+    if not st["lan_v6"] and not st["ignore_mac"]:
+        return
+    try:
+        tmp = LAN_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        os.replace(tmp, LAN_STATE_FILE)
     except Exception:
         pass
 
@@ -5332,6 +5368,7 @@ def main():
         PIHOLE_IPS.update(args.pihole)
     if args.ignore:
         IGNORE.update(args.ignore)
+    _load_lan_state()
     if args.no_alerts:
         CONF["notify"] = {}
     if PIHOLE_IPS:

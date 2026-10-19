@@ -522,6 +522,30 @@ def test_router_advertisement_teaches_the_capture_a_prefix():
         nw.LAN_V6_NETS = saved
 
 
+def test_lan_state_survives_a_restart():
+    saved = (nw.LAN_V6_NETS, set(nw.IGNORE), dict(nw.IGNORE_MAC), nw.LAN_STATE_FILE)
+    nw.LAN_STATE_FILE = os.path.join(tempfile.mkdtemp(), "lan.json")
+    try:
+        nw.LAN_V6_NETS = (nw.ipaddress.ip_network("2600:aa:bb:4::/64"),)
+        nw.IGNORE.clear(); nw.IGNORE.update({"192.168.1.2", "192.168.1.3"})
+        nw.IGNORE_MAC.clear()
+        nw.IGNORE_MAC.update({"aa:aa:aa:aa:aa:02": "192.168.1.2",
+                              "aa:aa:aa:aa:aa:03": "192.168.1.3"})
+        nw._save_lan_state()
+        # restart: state empty, and one device is no longer ignored
+        nw.LAN_V6_NETS = ()
+        nw.IGNORE_MAC.clear()
+        nw.IGNORE.discard("192.168.1.3")
+        nw._load_lan_state()
+        assert nw.ipaddress.ip_network("2600:aa:bb:4::/64") in nw.LAN_V6_NETS
+        assert nw.IGNORE_MAC == {"aa:aa:aa:aa:aa:02": "192.168.1.2"}
+    finally:
+        nw.LAN_V6_NETS = saved[0]
+        nw.IGNORE.clear(); nw.IGNORE.update(saved[1])
+        nw.IGNORE_MAC.clear(); nw.IGNORE_MAC.update(saved[2])
+        nw.LAN_STATE_FILE = saved[3]
+
+
 def test_learn_v6_prefix_rejects_non_lan_ranges():
     for bad in ("fd00::/64", "2001:db8::/16", "10.0.0.0/8"):
         try:
