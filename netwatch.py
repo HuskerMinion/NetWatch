@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.08.20.12"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.1"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -2028,10 +2028,10 @@ def _alert_pass(warmup):
             if mac:
                 _fire("device", dev, mac, "", None, names, learning,
                       msg="new device joined the network (MAC %s)" % mac)
-        # IPv6 leak. This network is deliberately v4-only (the DNS/DoH/DoT ACLs
-        # on the gateway are v4 rules), so a device reaching a global v6 address
-        # is either misconfigured or routing straight around those rules.
-        if CONF.get("alert_ipv6", True):
+        # IPv6 traffic. Off by default: on a dual-stack network it's normal. On a
+        # network run IPv4-only (alert_ipv6: true), a device reaching a global v6
+        # address is misconfigured or routing around v4-only firewall rules.
+        if CONF.get("alert_ipv6", False):
             v6 = [(d, r) for d, r, _p, _h, _f in cand if ":" in r]
             if v6:
                 with LOCK:
@@ -2045,8 +2045,7 @@ def _alert_pass(warmup):
                             e6["count"] += 1
                 for d, r in v6:
                     _fire("ipv6", d, v6_prefix(r), "", None, names, learning,
-                          msg="IPv6 traffic to %s — IPv6 is supposed to be "
-                              "disabled on this network" % r)
+                          msg="IPv6 traffic to %s" % r)
         # unsolicited inbound connection attempts (someone connecting TO us)
         for dev, rem, port in inbound:
             th = threat_match(rem)
@@ -2119,8 +2118,8 @@ def _fire(kind, dev, key, host, cc, names, learning, msg):
             return
         level = "warning"
     elif kind == "ipv6":
-        # IPv6 is meant to be off on this network, so any global v6 traffic is a
-        # misconfiguration (or a device routing around the v4 firewall rules).
+        # Only enabled for IPv4-only networks (alert_ipv6), where global v6
+        # traffic is a misconfiguration or a device routing around v4 rules.
         if learning:
             return
         level, rem_field = "warning", key
@@ -4075,8 +4074,8 @@ function renderList(){
     if(q && !(label+" "+dv.ip).toLowerCase().includes(q)) continue;
     const tb=dv.threats?'<span class="badge2 threat" title="talks to a flagged IP">&#9888;</span>':"";
     const vend=(!dv.name&&dv.vendor)?'<span class="vendor">('+esc(dv.vendor)+")</span>":"";
-    // IPv6 is meant to be off on this network, so seeing any is worth a badge.
-    const v6=dv.ipv6?'<span class="badge2 v6" title="talking over IPv6 — IPv6 should be disabled">IPv6</span>':"";
+    // Only populated when alert_ipv6 is on (an IPv4-only network).
+    const v6=dv.ipv6?'<span class="badge2 v6" title="talking over IPv6">IPv6</span>':"";
     const ag=dv.agent?'<span class="badge2 agent" title="process names reported by an agent on this machine">&#9881;</span>':"";
     drows.push('<div class="row'+(dv.active?"":" off")+(dv.threats?" flag":"")+(selDev===dv.ip?" sel":"")
       +'" data-dev="'+esc(dv.ip)+'"><div class="top"><div class="nm">'

@@ -82,8 +82,9 @@ Pi-hole bypass; the alerts feed is severity-coded.*
 - **Destination notes** — annotate any IP, hostname or `*.domain` with your own
   verdict ("Syncthing relay — expected"), from the dashboard or a JSON file, so a
   destination you've already vetted stops looking suspicious
-- **IPv6 leak alerts** — on a network run deliberately IPv4-only, any global v6
-  traffic is a misconfiguration or a device routing around your v4 firewall rules
+- **IPv6 leak alerts (optional)** — if you run your network IPv4-only, turn on
+  `alert_ipv6` and any global v6 traffic is flagged as a misconfiguration or a
+  device routing around your v4 firewall rules. Off by default
 - **Process attribution (optional)** — a mirrored port can never see *which program*
   opened a socket. Run [`netwatch_agent.py`](netwatch_agent.py) on a PC you care
   about and its flows gain process names, while every other device is unaffected

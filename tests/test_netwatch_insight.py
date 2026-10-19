@@ -4,7 +4,7 @@ Covers the four things added on top of the flow map:
 
   * destination notes      — annotate an IP / hostname / domain suffix
   * process attribution    — the optional per-PC agent's socket->process table
-  * IPv6 leak detection    — v6 is meant to be off on this network
+  * IPv6 leak detection    — opt-in, for networks run IPv4-only
   * device fingerprinting  — learned per-device baseline + deviation detection
 
 Run:  python3 -m pytest tests/     (or)   python3 tests/test_netwatch_insight.py
@@ -216,6 +216,15 @@ def test_ipv6_flow_alerts_once_per_prefix_and_shows_on_the_device():
     dev = [d for d in snap["devices"] if d["ip"] == "192.168.1.10"][0]
     assert dev["ipv6"] == 2
     assert snap["stats"]["ipv6"] == 1
+
+
+def test_ipv6_detection_is_off_by_default():
+    _reset()
+    nw.CONF = {}
+    nw._record("192.168.1.10", "2606:4700:4700::1111", "tcp", 443, up=1, down=1)
+    nw._alert_pass(warmup=0)
+    assert not [a for a in nw.ALERTS if a["kind"] == "ipv6"]
+    assert "192.168.1.10" not in nw.IPV6
 
 
 def test_ipv6_detection_can_be_switched_off():
