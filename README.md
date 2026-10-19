@@ -78,7 +78,9 @@ Pi-hole bypass; the alerts feed is severity-coded.*
 - **Device fingerprinting** — NetWatch learns each device's normal hours, ports,
   hourly volume and destination breadth, then alerts when one deviates. IoT gear is
   boringly consistent, which is exactly what makes a doorbell suddenly uploading
-  200 MB at 3am to fifty new hosts worth knowing about
+  200 MB at 3am to fifty new hosts worth knowing about. New-port alerts skip
+  ephemeral ports (32768 and up), which peer-to-peer apps and home routers pick
+  at random
 - **Destination notes** — annotate any IP, hostname or `*.domain` with your own
   verdict ("Syncthing relay — expected"), from the dashboard or a JSON file, so a
   destination you've already vetted stops looking suspicious
@@ -110,6 +112,10 @@ Pi-hole bypass; the alerts feed is severity-coded.*
   **unsolicited inbound** TCP connections opened *to* your devices from the internet.
 - HTTPS/TLS-over-TCP usually reveals the hostname via SNI. QUIC (UDP/443) is
   encrypted, so those show the real IP + reverse-DNS but not always a clean host.
+- **IPv6 works on dual-stack networks.** NetWatch learns your LAN's IPv6 prefixes
+  from router advertisements (or `lan_v6_prefixes`), shows v6 traffic on the same
+  device as its IPv4 traffic (matched by MAC), and checks v6 DNS for Pi-hole
+  bypass too. Traffic to your own public IP (hairpin) counts as local.
 - A small kernel filter drops LAN-to-LAN IPv4 traffic before NetWatch reads it
   (`kernel_filter`, on by default). Local streaming, cameras and backups can be
   most of what a mirrored port carries, and parsing it all in Python made the

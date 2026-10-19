@@ -338,6 +338,23 @@ def test_a_brand_new_port_is_reported_exactly_once():
     con.close()
 
 
+def test_ephemeral_ports_never_count_as_new():
+    _fresh_db()
+    _reset()
+    con = nw.db_connect()
+    now = time.time()
+    cur = int(now // 3600)
+    _seed_hours(con, "192.168.1.24", nw.PROFILE_MIN_HOURS + 5, 1024, 2, cur)
+    # Tailscale and camera relays: the far side's router picked these at random
+    con.execute("INSERT INTO sessions(dev,rem,first,last,up,down,ports) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ("192.168.1.24", "203.0.113.9", now - 30, now - 10, 10, 10,
+                 "41641,51805,65090"))
+    con.commit()
+    assert "port" not in [d["kind"] for d in nw.profile_pass(con, now)]
+    con.close()
+
+
 def test_profile_is_persisted_and_exposed_to_the_viz_endpoint():
     _fresh_db()
     _reset()

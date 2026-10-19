@@ -19,6 +19,9 @@
   "alert_ipv6": false,
   "_alert_ipv6": "Off by default. Set true only if your network is run IPv4-only: then any device reaching a global IPv6 address is either misconfigured or routing around v4-only firewall rules (for example ACLs that force DNS through a Pi-hole). Alerts are grouped per /64, so one device chatting to a dozen addresses at one provider produces one alert, not a dozen. Leave it false on a dual-stack network, where IPv6 traffic is normal.",
 
+  "lan_v6_prefixes": [],
+  "_lan_v6_prefixes": "Optional. On a dual-stack network your devices have public IPv6 addresses, so NetWatch has to know which prefixes are yours to tell a LAN device from an internet host. It learns them by itself from router advertisements on the mirror and from this machine's own addresses, and logs each one ('IPv6 LAN prefix ...'). List prefixes here only if one is never learned, e.g. [\"2001:db8:1234::/56\"]. IPv6 traffic is shown on the device with the same MAC address, so a PC rotating through temporary v6 addresses stays one device.",
+
   "kernel_filter": true,
   "_kernel_filter": "If true (default), a small filter in the kernel drops LAN-to-LAN IPv4 traffic before NetWatch reads it, keeping everything with an internet side, all IPv6, and DNS answers. On a mirrored port most traffic is local (streaming, cameras to an NVR, backups), and parsing it in Python is what makes the capture drop packets. Set false only to debug the capture; the dashboard looks the same either way.",
 

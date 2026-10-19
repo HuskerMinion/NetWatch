@@ -378,6 +378,159 @@ def test_kernel_filter_drops_frames_parse_frame_ignores():
     assert _bpf_run(code, b"\x00" * 10) == 0              # runt frame
 
 
+# --------------------------------------------------------------------------- #
+# Dual-stack LAN: the LAN's own global IPv6 prefix and public IPv4 address     #
+# --------------------------------------------------------------------------- #
+
+LAN6 = "2001:db8:aa:1::"           # stands in for an ISP-assigned /64
+
+
+def _with_lan(fn):
+    def run():
+        saved = (nw.LAN_V6_NETS, nw.WAN_IPS, dict(nw.DEV_MAC))
+        nw.LAN_V6_NETS = (nw.ipaddress.ip_network(LAN6 + "/64"),)
+        nw.WAN_IPS = {"93.184.216.34"}
+        try:
+            fn()
+        finally:
+            nw.LAN_V6_NETS, nw.WAN_IPS = saved[0], saved[1]
+            nw.DEV_MAC.clear(); nw.DEV_MAC.update(saved[2])
+            nw._MAC_V4["n"] = -1
+    run.__name__ = fn.__name__
+    return run
+
+
+def _frame6(src, dst, proto=17, sport=40000, dport=443, smac=b"\xaa" * 6,
+            dmac=b"\x11" * 6):
+    a = nw.ipaddress.ip_address
+    l4 = sport.to_bytes(2, "big") + dport.to_bytes(2, "big") + b"\x00" * 16
+    return (dmac + smac + b"\x86\xdd" + b"\x60\x00\x00\x00\x00\x14"
+            + bytes([proto, 64]) + a(src).packed + a(dst).packed + l4)
+
+
+def _handle(frame):
+    acc, dns, byp, macs, inb = {}, {}, [], {}, []
+    nw._handle_packet(bytearray(frame), len(frame), acc, dns, byp, macs, inb)
+    return acc, byp
+
+
+@_with_lan
+def test_classify_treats_the_lan_v6_prefix_as_lan():
+    dev = LAN6 + "1234"
+    assert nw.classify(dev, "2606:4700::1111") == (dev, "2606:4700::1111", "out")
+    assert nw.classify("2606:4700::1111", dev) == (dev, "2606:4700::1111", "in")
+    assert nw.classify(dev, LAN6 + "53") is None        # LAN to LAN
+    assert nw.classify(dev, "fd7a:115c:a1e0::53") is None
+
+
+def test_lan_v6_prefix_unknown_means_no_v6_flows():
+    saved = nw.LAN_V6_NETS
+    nw.LAN_V6_NETS = ()
+    try:
+        assert nw.classify(LAN6 + "1234", "2606:4700::1111") is None
+    finally:
+        nw.LAN_V6_NETS = saved
+
+
+@_with_lan
+def test_hairpin_to_our_own_public_address_is_not_a_flow():
+    assert nw.classify("192.168.1.10", "93.184.216.34") is None
+    assert nw.classify("93.184.216.34", "192.168.1.10") is None
+    assert nw.classify("192.168.1.10", "93.184.216.35") is not None
+
+
+@_with_lan
+def test_v6_flows_fold_onto_the_v4_device_with_the_same_mac():
+    nw.DEV_MAC["192.168.1.10"] = "aa:aa:aa:aa:aa:aa"
+    acc, _ = _handle(_frame6(LAN6 + "1234", "2606:4700::1111", 6))
+    assert ("192.168.1.10", "2606:4700::1111") in acc
+    # a rotated temporary address lands on the same device
+    acc, _ = _handle(_frame6(LAN6 + "beef", "2606:4700::1111", 6))
+    assert ("192.168.1.10", "2606:4700::1111") in acc
+    # replies arrive addressed to the device's MAC
+    acc, _ = _handle(_frame6("2606:4700::1111", LAN6 + "1234", 6, 443, 50000,
+                             smac=b"\x11" * 6, dmac=b"\xaa" * 6))
+    assert ("192.168.1.10", "2606:4700::1111") in acc
+    # an unknown MAC keeps its v6 address as the device
+    acc, _ = _handle(_frame6(LAN6 + "9", "2606:4700::1111", 6, smac=b"\xbb" * 6))
+    assert (LAN6 + "9", "2606:4700::1111") in acc
+
+
+@_with_lan
+def test_v6_dns_bypass_is_seen_but_the_lan_resolvers_are_not_flagged():
+    nw.DEV_MAC["192.168.1.10"] = "aa:aa:aa:aa:aa:aa"
+    _, byp = _handle(_frame6(LAN6 + "1234", "2001:4860:4860::8888", 17, 50000, 53))
+    assert ("192.168.1.10", "plaintext-dns", "2001:4860:4860::8888") in byp
+    _, byp = _handle(_frame6(LAN6 + "1234", "2001:4860:4860::8888", 6, 50000, 853))
+    assert ("192.168.1.10", "dot", "2001:4860:4860::8888") in byp
+    _, byp = _handle(_frame6(LAN6 + "1234", LAN6 + "53", 17, 50000, 53))
+    assert byp == [], "a Pi-hole's own v6 address is not a bypass"
+
+
+@_with_lan
+def test_an_ignored_resolver_stays_ignored_over_ipv6():
+    saved = set(nw.IGNORE)
+    nw.IGNORE.add("192.168.1.2")
+    nw.IGNORE_MAC.clear()
+    try:
+        # the resolver's own v4 upstream lookup teaches NetWatch its MAC ...
+        acc, byp = _handle(_frame("192.168.1.2", "192.5.6.30", 17, 40000, 53))
+        assert not acc and not byp
+        # ... so its v6 recursive lookups are neither a flow nor a bypass
+        smac = b"\xaa\xbb\xcc\xdd\xee\xff"
+        acc, byp = _handle(_frame6(LAN6 + "2", "2001:503:a83e::2:30", 17, 40000,
+                                   53, smac=smac))
+        assert not acc and not byp, (acc, byp)
+    finally:
+        nw.IGNORE.clear(); nw.IGNORE.update(saved)
+        nw.IGNORE_MAC.clear()
+
+
+def _ra(prefixes, vlan=False):
+    a = nw.ipaddress.ip_address
+    opts = b""
+    for pfx, plen in prefixes:
+        opts += (bytes([3, 4, plen, 0xc0]) + b"\x00" * 12 + a(pfx).packed)
+    icmp = bytes([134, 0, 0, 0, 64, 0, 0x07, 0x08]) + b"\x00" * 8 + opts
+    eth = b"\x33\x33\x00\x00\x00\x01" + b"\xcc" * 6
+    if vlan:
+        eth += b"\x81\x00\x00\xc8"
+    return (eth + b"\x86\xdd" + b"\x60\x00\x00\x00" + len(icmp).to_bytes(2, "big")
+            + bytes([58, 255]) + a("fe80::1").packed + a("ff02::1").packed + icmp)
+
+
+def test_router_advertisement_prefixes_are_parsed():
+    got = nw.parse_ra_prefixes(bytearray(_ra([(LAN6, 64)])), len(_ra([(LAN6, 64)])))
+    assert got == [nw.ipaddress.ip_network(LAN6 + "/64")]
+    f = _ra([("2001:db8:aa:2::", 64), ("2001:db8::", 32)], vlan=True)
+    got = nw.parse_ra_prefixes(bytearray(f), len(f))
+    assert got == [nw.ipaddress.ip_network("2001:db8:aa:2::/64")], \
+        "only /64s are learned from RAs"
+    junk = _frame6(LAN6 + "1", "2606:4700::1111")
+    assert nw.parse_ra_prefixes(bytearray(junk), len(junk)) == []
+
+
+def test_router_advertisement_teaches_the_capture_a_prefix():
+    saved = nw.LAN_V6_NETS
+    nw.LAN_V6_NETS = ()
+    try:
+        _handle(_ra([("2600:aa:bb:3::", 64)]))
+        assert nw.ipaddress.ip_network("2600:aa:bb:3::/64") in nw.LAN_V6_NETS
+        _handle(_ra([("2600:aa:bb:3::", 64)]))      # a repeat adds nothing
+        assert len(nw.LAN_V6_NETS) == 1
+    finally:
+        nw.LAN_V6_NETS = saved
+
+
+def test_learn_v6_prefix_rejects_non_lan_ranges():
+    for bad in ("fd00::/64", "2001:db8::/16", "10.0.0.0/8"):
+        try:
+            nw.learn_v6_prefix(nw.ipaddress.ip_network(bad), "test")
+        except ValueError:
+            continue
+        raise AssertionError("%s should be rejected" % bad)
+
+
 if __name__ == "__main__":
     fns = sorted(n for n in globals() if n.startswith("test_"))
     passed = 0

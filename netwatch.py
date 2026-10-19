@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.2"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.3"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -107,6 +107,9 @@ AGENT_MAX = 20000      # cap on mappings held in memory (oldest dropped first)
 # --- per-device behavioural profile ("fingerprint") --------------------------
 PROFILE_INTERVAL = 300     # seconds between fingerprint passes
 PROFILE_MIN_HOURS = 24     # hours of history required before deviations alert
+PROFILE_PORT_MAX = 32767   # higher ports are ephemeral: peer-to-peer apps (Tailscale,
+                           # cameras, calls) and home routers pick them at random,
+                           # so "first time on port 51805" says nothing
 PROFILE_VOL_FACTOR = 3.0   # hourly bytes above baseline_max * this = anomaly
 PROFILE_VOL_FLOOR = 10 * 1024 * 1024   # ...but never alert under this absolute
 PROFILE_DEST_FACTOR = 4.0  # distinct destinations in an hour vs baseline max
@@ -178,6 +181,9 @@ IPV6 = {}       # dev -> {"rem", "last", "count"} global IPv6 traffic seen
 PROFILE = {}    # dev -> learned behavioural profile (built by fingerprint_worker)
 DEVIATIONS = [] # recent profile deviations, newest last (also persisted)
 HOME = None
+WAN_IPS = set()     # our own public IPv4 address(es), from the home geolocation
+LAN_V6_NETS = ()    # the LAN's global IPv6 prefixes (config, this host, RAs)
+V6_LOCK = threading.Lock()
 GEO_STATE = "waiting"
 CAP_STATE = {"iface": "", "pkts": 0, "pps": 0.0, "drops": 0, "error": None,
              "demo": False}
@@ -201,6 +207,49 @@ def is_private_lan(a):
     return any(a in n for n in _PRIV)
 
 
+def is_lan(a):
+    """Private ranges, plus the LAN's own global IPv6 prefixes. A dual-stack LAN
+    gives its devices public v6 addresses, so 'private' alone can't tell a LAN
+    device from an internet host there."""
+    if is_private_lan(a):
+        return True
+    return a.version == 6 and any(a in n for n in LAN_V6_NETS)
+
+
+def learn_v6_prefix(net, source):
+    """Add a LAN IPv6 prefix (an ip_network). Returns True if it was new; raises
+    ValueError for anything that isn't a global v6 prefix of /32 or longer."""
+    global LAN_V6_NETS
+    if net.version != 6 or not net.network_address.is_global or net.prefixlen < 32:
+        raise ValueError("not a global IPv6 prefix of /32 or longer")
+    with V6_LOCK:
+        if net in LAN_V6_NETS or len(LAN_V6_NETS) >= 64:
+            return False
+        LAN_V6_NETS = LAN_V6_NETS + (net,)
+    print("  IPv6 LAN prefix %s (%s)" % (net, source))
+    return True
+
+
+def seed_v6_prefixes():
+    """The capture host's own global IPv6 addresses name a LAN prefix right away,
+    before the first router advertisement arrives."""
+    try:
+        with open("/proc/net/if_inet6") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) < 6 or f[3] != "00" or f[5] == "lo":   # 00 = global
+                    continue
+                addr = ipaddress.ip_address(":".join(f[0][i:i + 4]
+                                                     for i in range(0, 32, 4)))
+                plen = int(f[2], 16)
+                if plen <= 64 and addr.is_global:     # skips ULAs (Tailscale etc.)
+                    learn_v6_prefix(ipaddress.ip_network("%s/%d" % (addr, plen),
+                                                         strict=False),
+                                    "this host, %s" % f[5])
+    except (OSError, ValueError):
+        pass
+
+
 def v6_prefix(ip):
     """The /64 an IPv6 address sits in, used to group leak alerts so one device
     chatting to a dozen addresses at one provider doesn't produce a dozen alerts."""
@@ -216,9 +265,13 @@ def classify(src, dst):
         sa, da = ipaddress.ip_address(src), ipaddress.ip_address(dst)
     except ValueError:
         return None
-    if is_private_lan(sa) and da.is_global and not da.is_multicast:
+    # Traffic to our own public address is hairpinned by the router: it never
+    # leaves the LAN (Tailscale and Plex peers finding each other, mostly).
+    if src in WAN_IPS or dst in WAN_IPS:
+        return None
+    if is_lan(sa) and da.is_global and not da.is_multicast and not is_lan(da):
         return src, dst, "out"
-    if is_private_lan(da) and sa.is_global and not sa.is_multicast:
+    if is_lan(da) and sa.is_global and not sa.is_multicast and not is_lan(sa):
         return dst, src, "in"
     return None
 
@@ -510,11 +563,70 @@ def capture_loop(iface):
         time.sleep(3)
 
 
+def parse_ra_prefixes(buf, n):
+    """IPv6 router advertisement -> the /64 prefixes in its Prefix Information
+    options, as ip_networks. Anything else -> []."""
+    if n < 14:
+        return []
+    etype, l3 = (buf[12] << 8) | buf[13], 14
+    if etype == 0x8100 and n >= 18:
+        etype, l3 = (buf[16] << 8) | buf[17], 18
+    icmp = l3 + 40
+    if etype != 0x86DD or n < icmp + 16 or buf[l3 + 6] != 58 or buf[icmp] != 134:
+        return []
+    out, p = [], icmp + 16                    # options follow the 16-byte header
+    while p + 2 <= n:
+        otype, olen = buf[p], buf[p + 1] * 8
+        if olen == 0 or p + olen > n:
+            break
+        # Only /64s: that's what SLAAC hands out, and it stops a stray RA from
+        # claiming some huge range as "LAN" and hiding its traffic.
+        if otype == 3 and olen == 32 and buf[p + 2] == 64:
+            out.append(ipaddress.IPv6Network(
+                (int.from_bytes(bytes(buf[p + 16:p + 32]), "big"), 64), strict=False))
+        p += olen
+    return out
+
+
+_MAC_V4 = {"n": -1, "map": {}}
+IGNORE_MAC = {}  # MAC -> ignored IPv4 device, so its v6 addresses are ignored too
+
+
+def _mac_str(mac):
+    return "%02x:%02x:%02x:%02x:%02x:%02x" % tuple(mac)
+
+
+def _dev_for(addr, mac):
+    """The device name for a LAN address. An IPv6 address is folded onto the
+    IPv4 device with the same MAC, so one PC rotating through temporary v6
+    addresses stays one device. Unknown MACs keep the address itself."""
+    if ":" not in addr:
+        return addr
+    m = _mac_str(mac)
+    if m in IGNORE_MAC:                 # e.g. a Pi-hole's own upstream lookups
+        return IGNORE_MAC[m]
+    if len(DEV_MAC) != _MAC_V4["n"]:
+        _MAC_V4["map"] = {d_m: d for d, d_m in list(DEV_MAC.items()) if ":" not in d}
+        _MAC_V4["n"] = len(DEV_MAC)
+    return _MAC_V4["map"].get(m, addr)
+
+
+def _note_ignored(src, mac):
+    """Remember an ignored IPv4 device's MAC from a frame it sent."""
+    if src in IGNORE and ":" not in src and len(IGNORE_MAC) < 256:
+        IGNORE_MAC.setdefault(_mac_str(mac), src)
+
+
 def _handle_packet(buf, n, acc, dns_new, bypass_new, mac_new, inbound_new):
     """Process one captured frame into the local accumulators. Callers wrap this
     so a single malformed packet can never kill the capture thread."""
     pk = parse_frame(buf, n)
     if not pk:
+        for net in parse_ra_prefixes(buf, n):
+            try:
+                learn_v6_prefix(net, "router advertisement")
+            except ValueError:
+                pass
         return
     now = time.time()
     if pk["sport"] == 53:                          # a DNS response
@@ -524,23 +636,19 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new, mac_new, inbound_new):
                     dns_new[ip] = qname.lower().rstrip(".")
             except ValueError:
                 pass
-    elif pk["dport"] == 53:                        # a DNS query
+    elif pk["dport"] in (53, 853):                 # DNS query, or DoT (DoQ over UDP)
         try:
             sa = ipaddress.ip_address(pk["src"])
             da = ipaddress.ip_address(pk["dst"])
-            # Don't flag an excluded resolver's own upstream DNS as a "bypass".
-            if (pk["src"] not in IGNORE and is_private_lan(sa) and da.is_global
+            # A resolver on the LAN (the Pi-holes, by their v6 address too) is
+            # not a bypass; neither is an excluded resolver's own upstream DNS.
+            _note_ignored(pk["src"], buf[6:12])
+            dev = _dev_for(pk["src"], buf[6:12])
+            if (dev not in IGNORE and pk["src"] not in IGNORE and is_lan(sa)
+                    and da.is_global and not is_lan(da)
                     and pk["dst"] not in PIHOLE_IPS):
-                bypass_new.append((pk["src"], "plaintext-dns", pk["dst"]))
-        except ValueError:
-            pass
-    elif pk["dport"] == 853:                       # DNS-over-TLS (or DoQ over UDP)
-        try:
-            sa = ipaddress.ip_address(pk["src"])
-            da = ipaddress.ip_address(pk["dst"])
-            if (pk["src"] not in IGNORE and is_private_lan(sa) and da.is_global
-                    and pk["dst"] not in PIHOLE_IPS):
-                bypass_new.append((pk["src"], "dot", pk["dst"]))
+                bypass_new.append((dev, "plaintext-dns" if pk["dport"] == 53
+                                   else "dot", pk["dst"]))
         except ValueError:
             pass
 
@@ -549,6 +657,11 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new, mac_new, inbound_new):
         return
     dev, rem, direction = c
     if dev in IGNORE:      # excluded device: not listed, mapped, flagged or alerted
+        if direction == "out":
+            _note_ignored(dev, buf[6:12])
+        return
+    dev = _dev_for(dev, buf[6:12] if direction == "out" else buf[0:6])
+    if dev in IGNORE:
         return
 
     # Unsolicited inbound: a TCP SYN (no ACK) arriving FROM the internet TO a LAN
@@ -1151,15 +1264,19 @@ def _http_json(url, payload=None, timeout=12):
 
 
 def geolocate_home():
-    global HOME, GEO_STATE
+    global HOME, GEO_STATE, WAN_IPS
     try:
         r = _http_json(GEO_SELF_URL)
         if r.get("status") == "success":
+            if HOME is None:
+                print("  home location: %s, %s" % (r.get("city", ""),
+                                                   r.get("country", "")))
             HOME = {"lat": r["lat"], "lon": r["lon"], "city": r.get("city", ""),
                     "country": r.get("country", ""),
                     "countryCode": r.get("countryCode", "")}
             GEO_STATE = "ok"
-            print("  home location: %s, %s" % (HOME["city"], HOME["country"]))
+            if r.get("query"):          # our public address, for hairpin traffic
+                WAN_IPS = {r["query"]}
     except Exception:
         GEO_STATE = "offline"
 
@@ -1167,11 +1284,15 @@ def geolocate_home():
 def geo_worker():
     global GEO_STATE
     last_save = time.time()
+    last_home = now = time.time()
     if HOME is None:
         geolocate_home()
     while True:
         _beat("geo")
         now = time.time()
+        if now - last_home > 3600:      # the public address can change
+            geolocate_home()
+            last_home = now
         with LOCK:
             pending = [ip for ip in {f["rem"] for f in FLOWS.values()}
                        if ip not in GEO
@@ -1238,6 +1359,11 @@ def load_config():
     CONF = cfg
     PIHOLE_IPS = set(cfg.get("pihole_ips", []))
     IGNORE = set(cfg.get("ignore_devices", []))
+    for p in cfg.get("lan_v6_prefixes", []) or []:
+        try:
+            learn_v6_prefix(ipaddress.ip_network(str(p), strict=False), "config")
+        except ValueError as e:
+            print("  config: lan_v6_prefixes entry %r ignored (%s)" % (p, e))
     try:
         hrs = float(cfg.get("event_retain_hours", EVENT_RETAIN / 3600.0))
         # 5 minutes to 30 days; one window for BOTH inbound and flagged events
@@ -1902,7 +2028,7 @@ def profile_pass(con, now=None):
             (now - 2 * PROFILE_INTERVAL,)):
         s = port_new.setdefault(dev, set())
         for p in (ports or "").split(","):
-            if p.isdigit():
+            if p.isdigit() and int(p) <= PROFILE_PORT_MAX:
                 s.add(p)
 
     current = {}
@@ -5201,6 +5327,7 @@ def main():
 
     print("NetWatch v%s starting..." % VERSION)
     load_config()
+    seed_v6_prefixes()
     if args.pihole:
         PIHOLE_IPS.update(args.pihole)
     if args.ignore:
