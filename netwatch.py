@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.6"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.7"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -2136,7 +2136,10 @@ def profile_pass(con, now=None):
                                         "been active before" % h_now})
         known_ports = {x for x in (p["ports"] or "").split(",") if x}
         fresh = sorted(port_new.get(dev, set()) - known_ports, key=int)
-        if mature and fresh:
+        # A full port set has no baseline left (a torrent client, a peer-to-peer
+        # app), and a port past the cap is never stored, so it would be "new"
+        # on every pass.
+        if mature and fresh and len(known_ports) < PROFILE_MAX_PORTS:
             found.append({"dev": dev, "kind": "port", "value": int(fresh[0]),
                           "baseline": len(known_ports), "hour": cur_hour,
                           "detail": "used port %s for the first time"

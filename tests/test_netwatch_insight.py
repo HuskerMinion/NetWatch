@@ -355,6 +355,25 @@ def test_ephemeral_ports_never_count_as_new():
     con.close()
 
 
+def test_a_full_port_set_stops_new_port_alerts():
+    _fresh_db()
+    _reset()
+    con = nw.db_connect()
+    now = time.time()
+    cur = int(now // 3600)
+    _seed_hours(con, "192.168.1.24", nw.PROFILE_MIN_HOURS + 5, 1024, 2, cur)
+    nw.profile_pass(con, now)
+    full = ",".join(str(p) for p in range(1000, 1000 + nw.PROFILE_MAX_PORTS))
+    con.execute("UPDATE dev_profile SET ports=? WHERE dev=?", (full, "192.168.1.24"))
+    con.execute("INSERT INTO sessions(dev,rem,first,last,up,down,ports) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ("192.168.1.24", "203.0.113.9", now - 30, now - 10, 10, 10, "31575"))
+    con.commit()
+    for i in range(3):          # never stored, so it would be "new" every pass
+        assert "port" not in [d["kind"] for d in nw.profile_pass(con, now + i)]
+    con.close()
+
+
 def test_profile_is_persisted_and_exposed_to_the_viz_endpoint():
     _fresh_db()
     _reset()
