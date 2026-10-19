@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.1"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.2"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -586,12 +586,101 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new, mac_new, inbound_new):
         e["host"] = host
 
 
+# Kernel-side capture filter (classic BPF). On a mirrored port most frames are
+# LAN-to-LAN (local streaming, cameras to an NVR, backups), which classify()
+# throws away anyway; parsing them in Python is what made the socket overflow
+# and drop packets. The filter drops them in the kernel instead. It keeps:
+# every IPv4 frame with a public side, all IPv6, and DNS responses (source port
+# 53) even between two LAN hosts, because the Pi-holes' answers name the IPs.
+_BPF_ACCEPT = 0x40000          # snap length to keep (we read CAP_BYTES of it)
+
+
+def _bpf_v4_local(prog, off, local, other):
+    """Append: jump to `local` if the IPv4 address at `off` is private,
+    link-local, multicast or broadcast; otherwise jump to `other`."""
+    for mask, val in ((0xff000000, 0x0a000000), (0xfff00000, 0xac100000),
+                      (0xffff0000, 0xc0a80000), (0xffff0000, 0xa9fe0000),
+                      (0xf0000000, 0xe0000000), (0xffffffff, 0xffffffff)):
+        prog += [("ld", off), ("and", mask), ("jeq", val, local, None)]
+    prog.append(("ja", other))
+
+
+def _bpf_program():
+    """Build the filter as packed sock_filter structs (code, jt, jf, k)."""
+    prog = [("ldh", 12),
+            ("jeq", 0x8100, "vlan", None),
+            ("jeq", 0x0800, "v4_14", None),
+            ("jeq", 0x86DD, "accept", "drop"),
+            "vlan", ("ldh", 16),
+            ("jeq", 0x0800, "v4_18", None),
+            ("jeq", 0x86DD, "accept", "drop")]
+    for l3 in (14, 18):
+        p = "v4_%d_" % l3
+        prog.append("v4_%d" % l3)
+        _bpf_v4_local(prog, l3 + 12, p + "src_local", "accept")
+        prog.append(p + "src_local")
+        _bpf_v4_local(prog, l3 + 16, p + "both_local", "accept")
+        prog += [p + "both_local",
+                 ("ldb", l3 + 9),                       # protocol
+                 ("jeq", 6, p + "port", None),
+                 ("jeq", 17, p + "port", "drop"),
+                 p + "port",
+                 ("ldh", l3 + 6), ("jset", 0x1fff, "drop", None),  # fragment
+                 ("ldxmsh", l3),                        # X = IP header length
+                 ("ldhx", l3),                          # source port
+                 ("jeq", 53, "accept", "drop")]
+    prog += ["accept", ("ret", _BPF_ACCEPT), "drop", ("ret", 0)]
+
+    ops = {"ldh": 0x28, "ldb": 0x30, "ld": 0x20, "and": 0x54, "jeq": 0x15,
+           "jset": 0x45, "ja": 0x05, "ldxmsh": 0xb1, "ldhx": 0x48, "ret": 0x06}
+    labels, pc = {}, 0
+    for ins in prog:
+        if isinstance(ins, str):
+            labels[ins] = pc
+        else:
+            pc += 1
+    out, pc = [], 0
+    for ins in prog:
+        if isinstance(ins, str):
+            continue
+        op, k = ins[0], ins[1]
+        jt = jf = 0
+        if op in ("jeq", "jset"):
+            jt = labels[ins[2]] - pc - 1 if ins[2] else 0
+            jf = labels[ins[3]] - pc - 1 if ins[3] else 0
+        elif op == "ja":
+            k = labels[k] - pc - 1
+        assert 0 <= jt < 256 and 0 <= jf < 256, "BPF jump out of range"
+        out.append(struct.pack("HBBI", ops[op], jt, jf, k))
+        pc += 1
+    return b"".join(out)
+
+
+def _attach_filter(s):
+    """Attach the kernel filter to a packet socket. Returns True on success."""
+    import ctypes
+    code = _bpf_program()
+    blob = ctypes.create_string_buffer(code, len(code))
+    fprog = struct.pack("HL", len(code) // 8, ctypes.addressof(blob))
+    s.setsockopt(socket.SOL_SOCKET, 26, fprog)          # SO_ATTACH_FILTER
+    return True
+
+
 def _capture_session(iface):
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     except OSError:
         pass
+    if CONF.get("kernel_filter", True):
+        try:
+            _attach_filter(s)
+            print("  kernel filter: on (LAN-to-LAN traffic dropped before capture)")
+        except (OSError, ValueError) as e:
+            print("  warning: kernel filter not attached (%s); capturing "
+                  "everything" % e)
+    else:
+        print("  kernel filter: off (kernel_filter is false in the config)")
     s.bind((iface, 0))
     try:                    # promiscuous mode: accept mirrored frames
         idx = socket.if_nametoindex(iface)

@@ -110,8 +110,13 @@ Pi-hole bypass; the alerts feed is severity-coded.*
   **unsolicited inbound** TCP connections opened *to* your devices from the internet.
 - HTTPS/TLS-over-TCP usually reveals the hostname via SNI. QUIC (UDP/443) is
   encrypted, so those show the real IP + reverse-DNS but not always a clean host.
-- Under a fully saturated gigabit transfer the Pi may drop some mirrored packets
-  (shown in the header). Harmless here — we only need *which* endpoints, not bytes.
+- A small kernel filter drops LAN-to-LAN IPv4 traffic before NetWatch reads it
+  (`kernel_filter`, on by default). Local streaming, cameras and backups can be
+  most of what a mirrored port carries, and parsing it all in Python made the
+  capture drop packets. Traffic with an internet side, IPv6, and DNS answers
+  still come through.
+- Under a fully saturated gigabit transfer the Pi may still drop some mirrored
+  packets (shown in the header). Mostly harmless — byte totals read a little low.
 
 ## Requirements
 

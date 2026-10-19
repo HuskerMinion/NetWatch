@@ -19,6 +19,9 @@
   "alert_ipv6": false,
   "_alert_ipv6": "Off by default. Set true only if your network is run IPv4-only: then any device reaching a global IPv6 address is either misconfigured or routing around v4-only firewall rules (for example ACLs that force DNS through a Pi-hole). Alerts are grouped per /64, so one device chatting to a dozen addresses at one provider produces one alert, not a dozen. Leave it false on a dual-stack network, where IPv6 traffic is normal.",
 
+  "kernel_filter": true,
+  "_kernel_filter": "If true (default), a small filter in the kernel drops LAN-to-LAN IPv4 traffic before NetWatch reads it, keeping everything with an internet side, all IPv6, and DNS answers. On a mirrored port most traffic is local (streaming, cameras to an NVR, backups), and parsing it in Python is what makes the capture drop packets. Set false only to debug the capture; the dashboard looks the same either way.",
+
   "agent_token": "",
   "_agent_token": "Shared secret for the optional per-PC agent (netwatch_agent.py), which reports which PROCESS owns each connection on a machine you install it on — something a mirrored port can never see. Leave empty (the default) and the /agent endpoint refuses everything, so an unconfigured NetWatch cannot be fed data by anyone. Set a long random string here and pass the same value to the agent with --token. Only a LAN client can post, the token is compared in constant time, and the agent sends nothing but remote address, port and process name.",
 

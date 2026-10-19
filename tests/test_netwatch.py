@@ -45,18 +45,18 @@ def test_load_names_override_parses_and_skips_junk():
     nw.NAMES_FILE = os.path.join(d, "netwatch_names.json")
     with open(nw.NAMES_FILE, "w") as f:
         f.write('{"_comment":"skip","AA-BB-CC-DD-EE-FF":"Starlord",'
-                '"192.168.34.50":"Garage Cam","BB:BB:BB:BB:BB:BB":"  "}')
+                '"192.168.1.50":"Garage Cam","BB:BB:BB:BB:BB:BB":"  "}')
     got = nw.load_names_override()
-    assert got == {"aa:bb:cc:dd:ee:ff": "Starlord", "192.168.34.50": "Garage Cam"}
+    assert got == {"aa:bb:cc:dd:ee:ff": "Starlord", "192.168.1.50": "Garage Cam"}
 
 
 def test_override_name_prefers_mac_then_ip():
     nw.NAMES_OVERRIDE = {"aa:bb:cc:dd:ee:ff": "Starlord",
-                         "192.168.34.50": "Garage Cam"}
-    macs = {"192.168.34.10": "aa:bb:cc:dd:ee:ff"}
-    assert nw._override_name("192.168.34.10", macs) == "Starlord"      # by MAC
-    assert nw._override_name("192.168.34.50", macs) == "Garage Cam"    # by IP
-    assert nw._override_name("192.168.34.99", macs) == ""              # unknown
+                         "192.168.1.50": "Garage Cam"}
+    macs = {"192.168.1.10": "aa:bb:cc:dd:ee:ff"}
+    assert nw._override_name("192.168.1.10", macs) == "Starlord"      # by MAC
+    assert nw._override_name("192.168.1.50", macs) == "Garage Cam"    # by IP
+    assert nw._override_name("192.168.1.99", macs) == ""              # unknown
 
 
 # --------------------------------------------------------------------------- #
@@ -292,6 +292,90 @@ def test_parse_frame_ipv4_udp():
     pk = nw.parse_frame(frame, len(frame))
     assert pk and pk["src"] == "192.168.1.10" and pk["dst"] == "8.8.8.8"
     assert pk["dport"] == 53 and pk["proto"] == "udp"
+
+
+# --------------------------------------------------------------------------- #
+# Kernel capture filter (classic BPF) — run in a tiny interpreter, no root     #
+# --------------------------------------------------------------------------- #
+
+def _bpf_run(code, pkt):
+    """Execute packed sock_filter instructions the way the kernel does."""
+    import struct
+    ins = [struct.unpack("HBBI", code[i:i + 8]) for i in range(0, len(code), 8)]
+    a = x = pc = 0
+
+    def load(off, size):
+        if off + size > len(pkt):
+            raise IndexError
+        return int.from_bytes(pkt[off:off + size], "big")
+    try:
+        while True:
+            op, jt, jf, k = ins[pc]
+            pc += 1
+            if op == 0x28: a = load(k, 2)
+            elif op == 0x30: a = load(k, 1)
+            elif op == 0x20: a = load(k, 4)
+            elif op == 0x48: a = load(x + k, 2)
+            elif op == 0xb1: x = (load(k, 1) & 0xf) * 4
+            elif op == 0x54: a &= k
+            elif op == 0x15: pc += jt if a == k else jf
+            elif op == 0x45: pc += jt if a & k else jf
+            elif op == 0x05: pc += k
+            elif op == 0x06: return k
+            else: raise AssertionError("unknown BPF op %#x" % op)
+    except IndexError:
+        return 0                          # the kernel drops on an out-of-range load
+
+
+def _frame(src, dst, proto=17, sport=40000, dport=443, vlan=False, v6=False):
+    eth = b"\x11\x22\x33\x44\x55\x66" b"\xaa\xbb\xcc\xdd\xee\xff"
+    if vlan:
+        eth += b"\x81\x00\x00\x0a"
+    l4 = sport.to_bytes(2, "big") + dport.to_bytes(2, "big") + b"\x00" * 16
+    if v6:
+        return (eth + b"\x86\xdd" + b"\x60\x00\x00\x00\x00\x14" + bytes([proto, 64])
+                + bytes(16) + bytes(16) + l4)
+    ip = (b"\x45\x00\x00\x30" b"\x00\x00\x00\x00" + bytes([64, proto]) + b"\x00\x00"
+          + bytes(int(o) for o in src.split("."))
+          + bytes(int(o) for o in dst.split(".")))
+    return eth + b"\x08\x00" + ip + l4
+
+
+def test_kernel_filter_keeps_internet_traffic_and_drops_lan_to_lan():
+    code = nw._bpf_program()
+    keep = lambda f: _bpf_run(code, f) > 0
+    for vlan in (False, True):
+        assert keep(_frame("192.168.1.14", "142.250.72.14", 6, vlan=vlan))
+        assert keep(_frame("142.250.72.14", "10.0.0.5", 6, vlan=vlan))
+        assert keep(_frame("172.20.1.1", "8.8.8.8", 17, dport=53, vlan=vlan))
+        assert not keep(_frame("192.168.1.71", "192.168.1.14", 6, vlan=vlan))
+        assert not keep(_frame("10.1.2.3", "172.16.9.9", 17, vlan=vlan))
+        assert not keep(_frame("192.168.1.5", "224.0.0.251", 17, 5353, 5353, vlan=vlan))
+        assert not keep(_frame("192.168.1.5", "255.255.255.255", 17, 68, 67, vlan=vlan))
+        assert not keep(_frame("169.254.1.1", "192.168.1.1", 6, vlan=vlan))
+        # 172.32/12 is public, so 172.16/12 must not be over-matched
+        assert keep(_frame("172.32.0.1", "192.168.1.5", 6, vlan=vlan))
+        # IPv6 is passed through for the Python side to classify
+        assert keep(_frame("", "", 6, v6=True, vlan=vlan))
+
+
+def test_kernel_filter_keeps_lan_dns_answers_only():
+    code = nw._bpf_program()
+    keep = lambda f: _bpf_run(code, f) > 0
+    # A Pi-hole's answer to a LAN client is how NetWatch names destinations.
+    assert keep(_frame("192.168.1.155", "192.168.1.14", 17, sport=53, dport=51000))
+    assert keep(_frame("192.168.1.155", "192.168.1.14", 6, sport=53, dport=51000))
+    assert keep(_frame("192.168.1.155", "192.168.1.14", 17, sport=53, vlan=True))
+    # The query itself, LAN to LAN, carries nothing NetWatch uses.
+    assert not keep(_frame("192.168.1.14", "192.168.1.155", 17, 51000, 53))
+    assert not keep(_frame("192.168.1.155", "192.168.1.14", 1, sport=53))
+
+
+def test_kernel_filter_drops_frames_parse_frame_ignores():
+    code = nw._bpf_program()
+    arp = b"\xff" * 6 + b"\xaa" * 6 + b"\x08\x06" + b"\x00" * 28
+    assert _bpf_run(code, arp) == 0
+    assert _bpf_run(code, b"\x00" * 10) == 0              # runt frame
 
 
 if __name__ == "__main__":
