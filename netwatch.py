@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.8"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.9"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -594,6 +594,8 @@ _MAC_V4 = {"n": -1, "map": {}}
 IGNORE_MAC = {}  # MAC -> ignored IPv4 device, so its v6 addresses are ignored too
 MAC_V4_SAVED = {}  # MAC -> IPv4 device from before a restart, until it is seen again
 MAC_V4_SAVED_MAX = 4096
+SAVED_OWNER = {}   # IPv4 device -> its MAC before a restart, to spot a reused address
+PROFILE_RESETS = []  # (dev, hour) whose learned profile belongs to a previous device
 
 
 def _mac_str(mac):
@@ -627,16 +629,22 @@ def _mac_v4_map():
     return _MAC_V4["map"]
 
 
-def _learn_macs(mac_new):
+def _learn_macs(mac_new, now=None):
     """Record each device's MAC (caller holds LOCK). When an address shows up
     with a different MAC, DHCP gave it to another device: drop the old
-    device's name so it is looked up again."""
+    device's name so it is looked up again, and its learned profile so the
+    new device isn't judged against the old one's habits. The MAC from
+    before a restart counts too."""
+    hour = int((time.time() if now is None else now) // 3600)
     for dev, mac in mac_new.items():
-        old = DEV_MAC.get(dev)
+        old = DEV_MAC.get(dev) or SAVED_OWNER.pop(dev, None)
         DEV_MAC[dev] = mac
         if old and old != mac:
             DEV_NAMES.pop(dev, None)
             _MAC_V4["n"] = -1
+            if ":" not in dev:
+                PROFILE_RESETS.append((dev, hour))
+                del PROFILE_RESETS[:-1000]
 
 
 def _note_ignored(src, mac):
@@ -1306,8 +1314,10 @@ def _load_lan_state():
             IGNORE_MAC.setdefault(mac, dev)
     for mac, dev in list((st.get("mac_v4") or {}).items())[:MAC_V4_SAVED_MAX]:
         try:
-            if ipaddress.ip_address(dev).version == 4 and                     is_private_lan(ipaddress.ip_address(dev)):
+            a = ipaddress.ip_address(dev)
+            if a.version == 4 and is_private_lan(a):
                 MAC_V4_SAVED.setdefault(str(mac).lower(), dev)
+                SAVED_OWNER[dev] = str(mac).lower()
         except (ValueError, TypeError):
             pass
 
@@ -2075,6 +2085,14 @@ def profile_pass(con, now=None):
     Kept a pure function of (connection, clock) so tests can drive it."""
     now = time.time() if now is None else now
     cur_hour = int(now // 3600)
+    with LOCK:
+        resets = PROFILE_RESETS[:]
+        del PROFILE_RESETS[:]
+    for dev, hour in resets:
+        # The hour of the change mixes both devices; it stays, everything
+        # before it was the old device's.
+        con.execute("DELETE FROM dev_profile WHERE dev=?", (dev,))
+        con.execute("DELETE FROM dev_hourly WHERE dev=? AND hour<?", (dev, hour))
     profiles = {}
     for dev, first, last, hours, hod, ports, mx, mxd, avg, upd in con.execute(
             "SELECT dev,first,last,hours,hod,ports,max_bytes,max_dests,"

@@ -374,6 +374,56 @@ def test_a_full_port_set_stops_new_port_alerts():
     con.close()
 
 
+def test_a_reused_address_starts_a_fresh_profile():
+    _fresh_db()
+    _reset()
+    saved = (dict(nw.DEV_MAC), dict(nw.SAVED_OWNER))
+    con = nw.db_connect()
+    now = time.time()
+    cur = int(now // 3600)
+    dev = "192.168.1.24"
+    try:
+        nw.DEV_MAC.clear(); nw.SAVED_OWNER.clear(); del nw.PROFILE_RESETS[:]
+        _seed_hours(con, dev, nw.PROFILE_MIN_HOURS + 5, 1024, 2, cur)
+        nw.profile_pass(con, now)
+        nw._learn_macs({dev: "aa:aa:aa:aa:aa:01"}, now)
+        assert nw.PROFILE_RESETS == [], "a first sighting is not a change"
+        # DHCP gives the address to another device, which moves far more
+        nw._learn_macs({dev: "aa:aa:aa:aa:aa:02"}, now)
+        con.execute("INSERT OR REPLACE INTO dev_hourly(dev,hour,bytes,dests,flows)"
+                    " VALUES(?,?,?,?,?)", (dev, cur, 500 * 1024 * 1024, 2, 3))
+        con.commit()
+        found = nw.profile_pass(con, now)
+        assert "volume" not in [d["kind"] for d in found]
+        hours = [h for (h,) in con.execute(
+            "SELECT hour FROM dev_hourly WHERE dev=?", (dev,))]
+        assert hours == [cur], "only the hour of the change is kept"
+        assert nw.PROFILE[dev]["hours"] == 0
+    finally:
+        con.close()
+        nw.DEV_MAC.clear(); nw.DEV_MAC.update(saved[0])
+        nw.SAVED_OWNER.clear(); nw.SAVED_OWNER.update(saved[1])
+        del nw.PROFILE_RESETS[:]
+
+
+def test_a_reused_address_is_caught_across_a_restart():
+    saved = (dict(nw.DEV_MAC), dict(nw.SAVED_OWNER), dict(nw.DEV_NAMES))
+    try:
+        nw.DEV_MAC.clear(); del nw.PROFILE_RESETS[:]
+        nw.SAVED_OWNER.clear()
+        nw.SAVED_OWNER.update({"192.168.1.24": "aa:aa:aa:aa:aa:01",
+                               "192.168.1.25": "aa:aa:aa:aa:aa:03"})
+        nw._learn_macs({"192.168.1.24": "aa:aa:aa:aa:aa:01",     # same device
+                        "192.168.1.25": "aa:aa:aa:aa:aa:04"})    # a new one
+        assert [d for d, _ in nw.PROFILE_RESETS] == ["192.168.1.25"]
+        assert nw.SAVED_OWNER == {}, "each saved owner is used once"
+    finally:
+        nw.DEV_MAC.clear(); nw.DEV_MAC.update(saved[0])
+        nw.SAVED_OWNER.clear(); nw.SAVED_OWNER.update(saved[1])
+        nw.DEV_NAMES.clear(); nw.DEV_NAMES.update(saved[2])
+        del nw.PROFILE_RESETS[:]
+
+
 def test_profile_is_persisted_and_exposed_to_the_viz_endpoint():
     _fresh_db()
     _reset()

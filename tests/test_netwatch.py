@@ -622,6 +622,7 @@ def test_mac_links_survive_a_restart():
     finally:
         nw.MAC_V4_SAVED.clear(); nw.MAC_V4_SAVED.update(saved[0])
         nw.LAN_STATE_FILE = saved[1]
+        nw.SAVED_OWNER.clear()
 
 
 def test_an_address_given_to_another_device_is_relearned():

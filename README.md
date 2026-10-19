@@ -81,7 +81,9 @@ Pi-hole bypass; the alerts feed is severity-coded.*
   200 MB at 3am to fifty new hosts worth knowing about. New-port alerts skip
   ephemeral ports (32768 and up), which peer-to-peer apps and home routers pick
   at random, and stop for a device once it has used 200 different ports (a
-  torrent client, say), since its ports no longer say anything
+  torrent client, say), since its ports no longer say anything. When DHCP gives
+  an address to a different device (a new MAC), its profile starts over, so the
+  new device isn't judged by the old one's habits
 - **Destination notes** — annotate any IP, hostname or `*.domain` with your own
   verdict ("Syncthing relay — expected"), from the dashboard or a JSON file, so a
   destination you've already vetted stops looking suspicious
