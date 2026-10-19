@@ -624,6 +624,71 @@ def test_mac_links_survive_a_restart():
         nw.LAN_STATE_FILE = saved[1]
 
 
+def test_an_address_given_to_another_device_is_relearned():
+    saved = (dict(nw.DEV_MAC), dict(nw.DEV_NAMES))
+    try:
+        nw.DEV_MAC.clear(); nw.DEV_NAMES.clear()
+        nw.DEV_MAC["192.168.1.40"] = "aa:aa:aa:aa:aa:aa"
+        nw.DEV_NAMES["192.168.1.40"] = "Smoke Alarm"
+        macs = {}
+        frame = _frame("192.168.1.40", "93.184.216.35", 6, 50000, 443)
+        nw._handle_packet(bytearray(frame), len(frame), {}, {}, [], macs, [])
+        assert macs == {"192.168.1.40": "aa:bb:cc:dd:ee:ff"}
+        nw._learn_macs(macs)
+        assert nw.DEV_MAC["192.168.1.40"] == "aa:bb:cc:dd:ee:ff"
+        assert "192.168.1.40" not in nw.DEV_NAMES, "old device's name is dropped"
+        # the same MAC again is not re-reported
+        macs = {}
+        nw._handle_packet(bytearray(frame), len(frame), {}, {}, [], macs, [])
+        assert macs == {}
+    finally:
+        nw.DEV_MAC.clear(); nw.DEV_MAC.update(saved[0])
+        nw.DEV_NAMES.clear(); nw.DEV_NAMES.update(saved[1])
+        nw._MAC_V4["n"] = -1
+
+
+def test_viz_names_use_the_current_device_not_an_old_label():
+    _fresh_db()
+    saved = (dict(nw.DEV_MAC), dict(nw.DEV_NAMES))
+    con = nw.db_connect()
+    now = time.time()
+    for name, last in (("Nest Labs Inc.", now - 7200), ("", now - 60)):
+        con.execute("INSERT INTO sessions(dev,dev_name,rem,host,country,cc,"
+                    "first,last,up,down,threat) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    ("192.168.1.31", name, "93.184.216.35", "", "US", "US",
+                     last, last, 10, 10, ""))
+    con.execute("INSERT INTO deviations(ts,dev,kind,detail,value,baseline) "
+                "VALUES(?,?,?,?,?,?)", (now, "192.168.1.31", "volume", "x", 1, 1))
+    con.commit(); con.close()
+    try:
+        nw.DEV_MAC.clear(); nw.DEV_NAMES.clear()
+        name = lambda: nw.viz_data(24)["fingerprint"]["deviations"][0]["name"]
+        assert name() == "192.168.1.31", "the newest session has no label"
+        nw.DEV_NAMES["192.168.1.31"] = "Phone"
+        assert name() == "Phone", "the live name wins"
+    finally:
+        nw.DEV_MAC.clear(); nw.DEV_MAC.update(saved[0])
+        nw.DEV_NAMES.clear(); nw.DEV_NAMES.update(saved[1])
+
+
+def test_an_unlinked_ipv6_address_gets_no_new_country_alerts():
+    nw.CONF = {}
+    nw.ALERTS.clear(); nw._alert_dedup.clear()
+    nw.SEEN["dev_country"].clear()
+    now = time.time()
+    v6 = "2600:aa:bb:3::77"
+    nw.FLOWS = {(d, "93.184.216.35"): {
+        "dev": d, "rem": "93.184.216.35", "proto": "tcp", "ports": {443},
+        "first": now, "last": now, "pkts": 1, "up": 10, "down": 0, "host": ""}
+        for d in (v6, "192.168.1.70")}
+    nw.GEO = {"93.184.216.35": {"status": "ok", "countryCode": "CA",
+                                "country": "Canada"}}
+    nw.DEV_NAMES = {}; nw.BYPASS = {}; nw.INBOUND = {}
+    nw._alert_pass(0)
+    got = [a["dev"] for a in nw.ALERTS if a["kind"] == "dev_country"]
+    assert got == ["192.168.1.70"], got
+
+
 if __name__ == "__main__":
     fns = sorted(n for n in globals() if n.startswith("test_"))
     passed = 0

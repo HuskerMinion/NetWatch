@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.7"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.8"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -627,6 +627,18 @@ def _mac_v4_map():
     return _MAC_V4["map"]
 
 
+def _learn_macs(mac_new):
+    """Record each device's MAC (caller holds LOCK). When an address shows up
+    with a different MAC, DHCP gave it to another device: drop the old
+    device's name so it is looked up again."""
+    for dev, mac in mac_new.items():
+        old = DEV_MAC.get(dev)
+        DEV_MAC[dev] = mac
+        if old and old != mac:
+            DEV_NAMES.pop(dev, None)
+            _MAC_V4["n"] = -1
+
+
 def _note_ignored(src, mac):
     """Remember an ignored IPv4 device's MAC from a frame it sent."""
     if src in IGNORE and ":" not in src and len(IGNORE_MAC) < 256:
@@ -687,9 +699,12 @@ def _handle_packet(buf, n, acc, dns_new, bypass_new, mac_new, inbound_new):
         inbound_new.append((dev, rem, pk["dport"]))
 
     # Learn the device's MAC from the source of its outbound frames (src MAC is
-    # the LAN device's own hardware address on the wire).
-    if direction == "out" and dev not in DEV_MAC and dev not in mac_new:
-        mac_new[dev] = "%02x:%02x:%02x:%02x:%02x:%02x" % tuple(buf[6:12])
+    # the LAN device's own hardware address on the wire). Re-learned when it
+    # changes: DHCP hands a freed address to a different device.
+    if direction == "out" and dev not in mac_new:
+        mac = _mac_str(buf[6:12])
+        if DEV_MAC.get(dev) != mac:
+            mac_new[dev] = mac
 
     port = pk["dport"] if direction == "out" else pk["sport"]
     host = None
@@ -835,8 +850,7 @@ def _capture_session(iface):
                     IPDOMAIN.setdefault(ip, dom)
                 for dev, kind, detail in bypass_new:
                     _mark_bypass(dev, kind, detail)
-                for dev, mac in mac_new.items():
-                    DEV_MAC.setdefault(dev, mac)
+                _learn_macs(mac_new)
                 for dev, rem, dport in inbound_new:
                     _record_inbound(dev, rem, dport)
             acc.clear(); dns_new.clear(); bypass_new.clear()
@@ -2347,8 +2361,10 @@ def _alert_pass(warmup):
             # new destination for this device
             _fire("dev_rem", dev, rem, host, cc, names, learning,
                   msg="new destination %s%s" % (host or rem, ""))
-            # new country for this device
-            if cc:
+            # New country for this device. Not for an IPv6 address that isn't
+            # linked to a device yet: each new temporary address would start
+            # with no history, so every country it reaches would look new.
+            if cc and ":" not in dev:
                 _fire("dev_country", dev, cc, host, cc, names, learning,
                       msg="first connection to %s" % (g.get("country") or cc))
         # bypass alerts — one (device, resolver) pair at a time so the per-pair
@@ -2779,11 +2795,17 @@ def viz_data(hours=24):
     except Exception:
         return out
     try:
+        # Current name first, then the newest session's. MAX(dev_name) would
+        # pick whichever label sorts highest, so an address DHCP has since
+        # given to another device kept the old device's name.
+        with LOCK:
+            live = {d: n for d, n in DEV_NAMES.items() if n}
+            live_v = {d: mac_vendor(d) for d in list(DEV_MAC)}
         names = {}
-        for dev, nm in con.execute(
-                "SELECT dev, MAX(COALESCE(dev_name,'')) FROM sessions "
+        for dev, nm, _ in con.execute(
+                "SELECT dev, COALESCE(dev_name,''), MAX(last) FROM sessions "
                 "INDEXED BY ix_sess_last WHERE last >= ? GROUP BY dev", (since,)):
-            names[dev] = nm or ""
+            names[dev] = live.get(dev) or live_v.get(dev) or nm or ""
 
         # ---- constellation: top devices, each with its top destinations ------
         devs = []
