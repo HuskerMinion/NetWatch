@@ -555,6 +555,75 @@ def test_learn_v6_prefix_rejects_non_lan_ranges():
         raise AssertionError("%s should be rejected" % bad)
 
 
+def test_digest_lists_threats_in_window():
+    # digest_data swallows SQL errors, so a bad index hint would show up only
+    # as an empty list here.
+    _fresh_db()
+    con = nw.db_connect()
+    now = time.time()
+    for dev, rem, last, th in (("a", "x", now - 60, "feodo"),
+                               ("a", "x", now - 30, "feodo"),
+                               ("b", "y", now - 50, ""),
+                               ("c", "z", now - 40 * 86400, "feodo")):
+        con.execute("INSERT INTO sessions(dev,dev_name,rem,host,country,cc,"
+                    "first,last,up,down,threat) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (dev, dev, rem, rem, "US", "US", last, last, 10, 10, th))
+    con.commit(); con.close()
+    th = nw.digest_data(7)["threats"]
+    assert [(t["dev_ip"], t["ip"], t["total"]) for t in th] == [("a", "x", 40)]
+
+
+@_with_lan
+def test_saved_mac_links_fold_v6_before_the_device_is_seen_on_v4():
+    saved = dict(nw.MAC_V4_SAVED)
+    nw.DEV_MAC.clear(); nw._MAC_V4["n"] = -1
+    nw.MAC_V4_SAVED.clear()
+    nw.MAC_V4_SAVED.update({"aa:aa:aa:aa:aa:aa": "192.168.1.10",
+                            "cc:cc:cc:cc:cc:cc": "192.168.1.30"})
+    try:
+        acc, _ = _handle(_frame6(LAN6 + "1234", "2606:4700::1111", 6))
+        assert ("192.168.1.10", "2606:4700::1111") in acc
+        # .30 now belongs to another MAC, so the saved link is not used
+        nw.DEV_MAC["192.168.1.30"] = "dd:dd:dd:dd:dd:dd"
+        acc, _ = _handle(_frame6(LAN6 + "c", "2606:4700::1111", 6, smac=b"\xcc" * 6))
+        assert (LAN6 + "c", "2606:4700::1111") in acc
+        # a live link beats a saved one
+        nw.DEV_MAC["192.168.1.11"] = "aa:aa:aa:aa:aa:aa"
+        acc, _ = _handle(_frame6(LAN6 + "1234", "2606:4700::1111", 6))
+        assert ("192.168.1.11", "2606:4700::1111") in acc
+    finally:
+        nw.MAC_V4_SAVED.clear(); nw.MAC_V4_SAVED.update(saved)
+
+
+@_with_lan
+def test_mac_links_survive_a_restart():
+    saved = (dict(nw.MAC_V4_SAVED), nw.LAN_STATE_FILE)
+    nw.LAN_STATE_FILE = os.path.join(tempfile.mkdtemp(), "lan.json")
+    try:
+        nw.DEV_MAC.clear(); nw._MAC_V4["n"] = -1
+        nw.DEV_MAC.update({"192.168.1.10": "aa:aa:aa:aa:aa:aa",
+                           "192.168.1.20": "bb:bb:bb:bb:bb:bb",
+                           LAN6 + "1": "aa:aa:aa:aa:aa:aa"})
+        nw.MAC_V4_SAVED.clear()
+        nw.MAC_V4_SAVED.update({"cc:cc:cc:cc:cc:cc": "192.168.1.30",   # kept
+                                "ee:ee:ee:ee:ee:ee": "192.168.1.20"})  # .20 moved
+        nw._save_lan_state()
+        with open(nw.LAN_STATE_FILE, encoding="utf-8") as f:
+            st = nw.json.load(f)
+        st["mac_v4"]["ff:ff:ff:ff:ff:ff"] = "8.8.8.8"          # junk is dropped
+        st["mac_v4"]["11:11:11:11:11:11"] = LAN6 + "2"
+        with open(nw.LAN_STATE_FILE, "w", encoding="utf-8") as f:
+            nw.json.dump(st, f)
+        nw.MAC_V4_SAVED.clear()
+        nw._load_lan_state()
+        assert nw.MAC_V4_SAVED == {"aa:aa:aa:aa:aa:aa": "192.168.1.10",
+                                   "bb:bb:bb:bb:bb:bb": "192.168.1.20",
+                                   "cc:cc:cc:cc:cc:cc": "192.168.1.30"}
+    finally:
+        nw.MAC_V4_SAVED.clear(); nw.MAC_V4_SAVED.update(saved[0])
+        nw.LAN_STATE_FILE = saved[1]
+
+
 if __name__ == "__main__":
     fns = sorted(n for n in globals() if n.startswith("test_"))
     passed = 0

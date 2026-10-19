@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.5"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.6"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -592,6 +592,8 @@ def parse_ra_prefixes(buf, n):
 
 _MAC_V4 = {"n": -1, "map": {}}
 IGNORE_MAC = {}  # MAC -> ignored IPv4 device, so its v6 addresses are ignored too
+MAC_V4_SAVED = {}  # MAC -> IPv4 device from before a restart, until it is seen again
+MAC_V4_SAVED_MAX = 4096
 
 
 def _mac_str(mac):
@@ -607,10 +609,22 @@ def _dev_for(addr, mac):
     m = _mac_str(mac)
     if m in IGNORE_MAC:                 # e.g. a Pi-hole's own upstream lookups
         return IGNORE_MAC[m]
+    v4 = _mac_v4_map().get(m)
+    if v4:
+        return v4
+    # Not seen on IPv4 since the restart: use the saved link, unless that
+    # address now belongs to a different MAC (DHCP gave it to someone else).
+    v4 = MAC_V4_SAVED.get(m)
+    if v4 and DEV_MAC.get(v4, m) == m:
+        return v4
+    return addr
+
+
+def _mac_v4_map():
     if len(DEV_MAC) != _MAC_V4["n"]:
         _MAC_V4["map"] = {d_m: d for d, d_m in list(DEV_MAC.items()) if ":" not in d}
         _MAC_V4["n"] = len(DEV_MAC)
-    return _MAC_V4["map"].get(m, addr)
+    return _MAC_V4["map"]
 
 
 def _note_ignored(src, mac):
@@ -1259,9 +1273,10 @@ def _save_cache():
 
 
 def _load_lan_state():
-    """Reload learned v6 prefixes and ignored devices' MACs. Without the MACs, a
-    Pi-hole's own v6 lookups look like a device bypassing DNS until its first
-    IPv4 frame arrives after a restart."""
+    """Reload learned v6 prefixes, ignored devices' MACs and each MAC's IPv4
+    device. Without them, after a restart a Pi-hole's own v6 lookups look like
+    a device bypassing DNS, and a device's v6 traffic shows as a separate
+    device, until its first IPv4 frame arrives."""
     try:
         with open(LAN_STATE_FILE, "r", encoding="utf-8") as f:
             st = json.load(f)
@@ -1275,12 +1290,26 @@ def _load_lan_state():
     for mac, dev in (st.get("ignore_mac") or {}).items():
         if dev in IGNORE:                    # only while still ignored
             IGNORE_MAC.setdefault(mac, dev)
+    for mac, dev in list((st.get("mac_v4") or {}).items())[:MAC_V4_SAVED_MAX]:
+        try:
+            if ipaddress.ip_address(dev).version == 4 and                     is_private_lan(ipaddress.ip_address(dev)):
+                MAC_V4_SAVED.setdefault(str(mac).lower(), dev)
+        except (ValueError, TypeError):
+            pass
 
 
 def _save_lan_state():
     st = {"lan_v6": [str(n) for n in LAN_V6_NETS],
           "ignore_mac": {m: d for m, d in list(IGNORE_MAC.items()) if d in IGNORE}}
-    if not st["lan_v6"] and not st["ignore_mac"]:
+    # Live links win; saved ones are kept unless their address moved to another MAC.
+    live = _mac_v4_map()
+    links = {m: d for m, d in list(MAC_V4_SAVED.items())
+             if m not in live and DEV_MAC.get(d, m) == m}
+    links.update(live)
+    if len(links) > MAC_V4_SAVED_MAX:
+        links = dict(list(links.items())[-MAC_V4_SAVED_MAX:])
+    st["mac_v4"] = links
+    if not st["lan_v6"] and not st["ignore_mac"] and not links:
         return
     try:
         tmp = LAN_STATE_FILE + ".tmp"
@@ -2507,6 +2536,8 @@ def digest_data(days):
         con = db_connect()
         # Aggregate in SQL (uses the ix_sess_last index) instead of pulling every
         # session row into Python — this is what keeps the digest fast over 30 days.
+        # The GROUP BY dev queries name the index: left alone, SQLite walks the
+        # whole table in device order instead (48s vs 1.5s on 5.7M rows).
         row = con.execute(
             "SELECT COALESCE(SUM(up+down),0), COUNT(DISTINCT dev), "
             "COUNT(DISTINCT rem), COUNT(DISTINCT NULLIF(cc,'')) "
@@ -2516,8 +2547,8 @@ def digest_data(days):
                     "total": (up or 0) + (down or 0)}
                    for dev, nm, up, down in con.execute(
                        "SELECT dev, MAX(dev_name), SUM(up), SUM(down) FROM sessions "
-                       "WHERE last>=? GROUP BY dev ORDER BY SUM(up+down) DESC "
-                       "LIMIT 10", (since,))]
+                       "INDEXED BY ix_sess_last WHERE last>=? GROUP BY dev "
+                       "ORDER BY SUM(up+down) DESC LIMIT 10", (since,))]
         top_dst = [{"ip": rem, "host": host or rem, "cc": cc or "", "up": up or 0,
                     "down": down or 0, "total": (up or 0) + (down or 0)}
                    for rem, host, cc, up, down in con.execute(
@@ -2550,7 +2581,8 @@ def digest_data(days):
                    in con.execute(
                        "SELECT dev, MAX(dev_name), rem, MAX(host), MAX(country), "
                        "MAX(cc), SUM(up), SUM(down), MIN(first), MAX(last), "
-                       "MAX(threat) FROM sessions WHERE threat<>'' AND last>=? "
+                       "MAX(threat) FROM sessions INDEXED BY ix_sess_last "
+                       "WHERE threat<>'' AND last>=? "
                        "GROUP BY dev, rem ORDER BY MAX(last) DESC LIMIT 50",
                        (since,))]
         con.close()
