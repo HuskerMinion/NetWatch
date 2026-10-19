@@ -2,7 +2,7 @@
 """Tests for NetWatch's security-EVENT model (flagged + inbound retention),
 blocklist attribution, and the /detail aggregation.
 
-The behaviour under test is the fix for "the flagged box at the top resets too
+The behavior under test is the fix for "the flagged box at the top resets too
 quickly": a threat-list hit must stay on the counter for the full retention
 window (the same one inbound uses), not disappear when the flow ages out of the
 live table after DROP_AFTER seconds.
@@ -330,7 +330,7 @@ class NotifyQueue(unittest.TestCase):
 
 
 class ConfigKnob(unittest.TestCase):
-    def test_event_retain_hours_is_honoured_and_clamped(self):
+    def test_event_retain_hours_is_honored_and_clamped(self):
         orig = nw.EVENT_RETAIN
         try:
             tmp = tempfile.mkdtemp()

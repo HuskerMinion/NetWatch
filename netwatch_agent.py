@@ -29,7 +29,7 @@ Deploying it on a machine
 One command. It tests the connection first, saves the settings, and only then
 registers itself to start automatically:
 
-    python netwatch_agent.py --install --server 192.168.34.76 --token SECRET
+    python netwatch_agent.py --install --server 192.168.1.76 --token SECRET
 
 If the token is wrong or NetWatch is unreachable you find out immediately,
 instead of it silently doing nothing at every logon. Afterwards:

@@ -4,7 +4,7 @@
 alerts, threat-intelligence flagging, history, and Pi-hole-bypass detection.**
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
-![Platform](https://img.shields.io/badge/platform-Linux%20(Raspberry%20Pi)-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20(Raspberry%20Pi)-lightgray)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-none%20(stdlib)-brightgreen)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/huskerminion)
@@ -256,7 +256,7 @@ the alerts feed, a threat hit or top destination in the digest. The drawer answe
   that particular list means (a Tor exit node is a very different story from a
   Spamhaus DROP netblock)
 - **identity** — hostnames seen via TLS SNI and DNS, reverse DNS, city/country, ISP
-  and organisation
+  and organization
 - **who touched it** — every device, with ports, protocol, and volume; live flows
   now, retained flagged contacts, unsolicited inbound attempts, and per-device
   history over the 30-day retention
@@ -323,7 +323,7 @@ raises nothing at all.
 The basemap is **CARTO dark_matter**, drawn as-is. The near-black ground is the
 point: the connection arcs carry device identity, so they are mid-lightness by
 design, and a darker map is what makes them legible. Lighter treatments were
-tried — sepia, a dimmed CARTO Voyager with blue water and grey land — and each
+tried — sepia, a dimmed CARTO Voyager with blue water and gray land — and each
 cost more in arc contrast than it gained in map detail.
 
 If you want to experiment anyway, five variables at the top of the `:root` block
@@ -337,7 +337,7 @@ identity (no change); reload with Ctrl+F5 after editing:
 
 `--map-bright:1.3` lightens the land; `--map-sepia:.6` warms the whole map toward
 brown. Watch the arcs as you go — that is the thing being traded away. The filter
-is scoped to the tile layer, so markers, arcs and tooltips keep their true colours
+is scoped to the tile layer, so markers, arcs and tooltips keep their true colors
 whatever you set.
 
 ### 13. Performance on modest hardware
@@ -357,7 +357,7 @@ still see everything, it just isn't moving. Adjust or disable:
 | **motion** button in the header | toggles animation off/on, remembered per browser |
 | `?anim=0` | open the dashboard with animation off |
 | `?anim=60` | raise the budget on a strong machine |
-| `prefers-reduced-motion` | honoured automatically — no animation at all |
+| `prefers-reduced-motion` | honored automatically — no animation at all |
 
 **First start after upgrading.** NetWatch builds one optional index over the
 `sessions` table. On a long-running install that can take a minute or two, so it
@@ -399,7 +399,7 @@ about:
 2. Copy `netwatch_agent.py` to the PC and run it:
 
 ```bash
-python3 netwatch_agent.py --server 192.168.34.50 --token YOUR-TOKEN
+python3 netwatch_agent.py --server 192.168.1.50 --token YOUR-TOKEN
 ```
 
 It is pure standard library, opens no listening port, and sends only remote
@@ -411,7 +411,7 @@ map tooltip and the detail drawer. Every other device on the network is unaffect
 **To leave it running permanently**, add `--install`:
 
 ```bash
-python netwatch_agent.py --install --server 192.168.34.76 --token YOUR-TOKEN
+python netwatch_agent.py --install --server 192.168.1.76 --token YOUR-TOKEN
 ```
 
 That tests the connection *first* and only registers autostart if the report is
@@ -434,7 +434,7 @@ settings.
 isn't the process name by itself — it's what it does to alerts you already get: a
 threat-list hit becomes "*which binary* is talking to that address", a DNS-bypass
 alert tells you whether it's Chrome doing its default DoH or something you don't
-recognise, and a fingerprint deviation names the program that used a new port.
+recognize, and a fingerprint deviation names the program that used a new port.
 NetWatch still sees every other device completely; those flows just stay anonymous.
 Note the agent polls every 15s, so a connection that opens and closes between polls
 is still seen by NetWatch but won't carry a process name.

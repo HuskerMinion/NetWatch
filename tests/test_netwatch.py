@@ -44,17 +44,17 @@ def test_load_names_override_parses_and_skips_junk():
     d = tempfile.mkdtemp()
     nw.NAMES_FILE = os.path.join(d, "netwatch_names.json")
     with open(nw.NAMES_FILE, "w") as f:
-        f.write('{"_comment":"skip","AA-BB-CC-DD-EE-FF":"Starlord",'
+        f.write('{"_comment":"skip","AA-BB-CC-DD-EE-FF":"Office PC",'
                 '"192.168.1.50":"Garage Cam","BB:BB:BB:BB:BB:BB":"  "}')
     got = nw.load_names_override()
-    assert got == {"aa:bb:cc:dd:ee:ff": "Starlord", "192.168.1.50": "Garage Cam"}
+    assert got == {"aa:bb:cc:dd:ee:ff": "Office PC", "192.168.1.50": "Garage Cam"}
 
 
 def test_override_name_prefers_mac_then_ip():
-    nw.NAMES_OVERRIDE = {"aa:bb:cc:dd:ee:ff": "Starlord",
+    nw.NAMES_OVERRIDE = {"aa:bb:cc:dd:ee:ff": "Office PC",
                          "192.168.1.50": "Garage Cam"}
     macs = {"192.168.1.10": "aa:bb:cc:dd:ee:ff"}
-    assert nw._override_name("192.168.1.10", macs) == "Starlord"      # by MAC
+    assert nw._override_name("192.168.1.10", macs) == "Office PC"      # by MAC
     assert nw._override_name("192.168.1.50", macs) == "Garage Cam"    # by IP
     assert nw._override_name("192.168.1.99", macs) == ""              # unknown
 

@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Configuration / shared state
 # ----------------------------------------------------------------------------
 
-VERSION = "2026.10.19.4"  # date + same-day build number, so successive changes on
+VERSION = "2026.10.19.5"  # date + same-day build number, so successive changes on
                           # one day are distinguishable. Shown in the header +
                           # startup log to confirm which build is actually running.
 DEFAULT_PORT = 8339
@@ -106,7 +106,7 @@ THREAT_CACHE_MAX = 50000   # cap the threat-match memo cache (bounds long-run me
 AGENT_TTL = 900        # a reported socket->process mapping is trusted this long
 AGENT_MAX = 20000      # cap on mappings held in memory (oldest dropped first)
 
-# --- per-device behavioural profile ("fingerprint") --------------------------
+# --- per-device behavioral profile ("fingerprint") --------------------------
 PROFILE_INTERVAL = 300     # seconds between fingerprint passes
 PROFILE_MIN_HOURS = 24     # hours of history required before deviations alert
 PROFILE_PORT_MAX = 32767   # higher ports are ephemeral: peer-to-peer apps (Tailscale,
@@ -180,7 +180,7 @@ NOTES = {}      # dest key (IP / hostname / *.suffix) -> user note text
 PROCS = {}      # (dev, rem, port) -> {"proc", "pid", "ts"} from a per-PC agent
 AGENTS = {}     # dev IP -> {"host", "os", "last", "n"} agent check-in state
 IPV6 = {}       # dev -> {"rem", "last", "count"} global IPv6 traffic seen
-PROFILE = {}    # dev -> learned behavioural profile (built by fingerprint_worker)
+PROFILE = {}    # dev -> learned behavioral profile (built by fingerprint_worker)
 DEVIATIONS = [] # recent profile deviations, newest last (also persisted)
 HOME = None
 WAN_IPS = set()     # our own public IPv4 address(es), from the home geolocation
@@ -897,7 +897,7 @@ def demo_loop():
     CAP_STATE["iface"] = "demo"
     devices = ["192.168.1.20", "192.168.1.31", "192.168.1.44", "192.168.1.57",
                "192.168.1.66"]
-    dnames = {"192.168.1.20": "terry-pc", "192.168.1.31": "living-room-tv",
+    dnames = {"192.168.1.20": "office-pc", "192.168.1.31": "living-room-tv",
               "192.168.1.44": "pixel-phone", "192.168.1.57": "ring-doorbell"}
     # 192.168.1.66 intentionally has no hostname -> named by MAC vendor instead
     remotes = [
@@ -1618,7 +1618,7 @@ def db_init():
     # db_index_worker(). Building it over a large existing sessions table takes
     # minutes on a Pi, and db_init() runs BEFORE the web server binds its port,
     # so doing it here made the dashboard unreachable for the whole build on the
-    # first start after an upgrade. It is an optimisation, not a correctness
+    # first start after an upgrade. It is an optimization, not a correctness
     # requirement, so it is built in the background instead.
     con.execute("""CREATE TABLE IF NOT EXISTS seen(
         kind TEXT, a TEXT, b TEXT, first REAL, PRIMARY KEY(kind,a,b))""")
@@ -1641,7 +1641,7 @@ def db_init():
         dev TEXT, rem TEXT, ports TEXT, first REAL, last REAL, count INTEGER,
         PRIMARY KEY(dev, rem))""")
     con.execute("CREATE INDEX IF NOT EXISTS ix_inb_last ON inbound_hits(last)")
-    # Hourly per-device rollup that the behavioural profile is computed from.
+    # Hourly per-device rollup that the behavioral profile is computed from.
     # One row per (device, hour) — tiny, and it makes the fingerprint pass a few
     # indexed reads instead of a scan over every session ever recorded.
     con.execute("""CREATE TABLE IF NOT EXISTS dev_hourly(
@@ -1995,7 +1995,7 @@ def db_history(since, dev=None, limit=500):
 
 
 # ----------------------------------------------------------------------------
-# Device behavioural profile ("fingerprint") + deviation detection
+# Device behavioral profile ("fingerprint") + deviation detection
 # ----------------------------------------------------------------------------
 # A mirrored port sees devices, not processes, so instead of fingerprinting an
 # application we fingerprint a DEVICE: the hours it is normally awake, the ports
@@ -2375,7 +2375,7 @@ def _fire(kind, dev, key, host, cc, names, learning, msg):
             return
         level, rem_field = "warning", key
     elif kind.startswith("profile_"):
-        # Behavioural deviation from the device's learned fingerprint.
+        # Behavioral deviation from the device's learned fingerprint.
         if learning:
             return
         level = "warning" if kind == "profile_volume" else "notice"
@@ -3496,7 +3496,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
   :root{
     color-scheme:dark;
-    /* Dark GREY rather than near-black: enough lift that panels read as
+    /* Dark GRAY rather than near-black: enough lift that panels read as
        surfaces instead of holes, while still sitting behind a bright map. */
     --surface-1:#212429; --surface-2:#282c32; --surface-3:#343941;
     --border:#454b55; --border-soft:#333840;
@@ -3508,11 +3508,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     /* CARTO dark_matter, shipped as-drawn. Near-black land is what gives the
        connection arcs their contrast: the arcs carry device identity, so they
        are mid-lightness by design, and every attempt to lighten the ground
-       (brown, then grey-blue, then dark grey) cost more in arc legibility than
+       (brown, then gray-blue, then dark gray) cost more in arc legibility than
        it bought in map detail. The values below are identity — a dial to
        experiment with, not a treatment:
          --map-bright  1.3 for a lighter map   --map-sepia .6 for a sepia one
-         --map-sat     raise to bring out what little colour the tiles carry */
+         --map-sat     raise to bring out what little color the tiles carry */
     --map-bright:1; --map-sepia:0; --map-sat:1;
     --map-hue:0deg; --map-contrast:1;
   }
@@ -3548,8 +3548,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .tile{position:relative;background:linear-gradient(180deg,#383d46,#2c3038);
     border:1px solid var(--border);border-radius:10px;padding:6px 13px 6px 14px;
     text-align:right;min-width:78px;overflow:hidden;transition:all .16s}
-  /* left edge lights up in the tile's own colour — a quiet status cue that
-     doesn't need reading, plus it stops the row looking like grey boxes */
+  /* left edge lights up in the tile's own color — a quiet status cue that
+     doesn't need reading, plus it stops the row looking like gray boxes */
   .tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
     background:var(--accent);opacity:.55}
   .tile b{display:block;font-size:17px;font-variant-numeric:tabular-nums;line-height:1.15}
@@ -3577,7 +3577,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #map{height:100%;background:var(--surface-1)}
   /* Identity by default (see --map-* above). Scoped to the CARTO layer, NOT the
      whole tile pane, so the OSM fallback keeps its own treatment below and so
-     markers, arcs and tooltips (other panes) keep their true colour. */
+     markers, arcs and tooltips (other panes) keep their true color. */
   .nm-base{filter:brightness(var(--map-bright)) sepia(var(--map-sepia))
     saturate(var(--map-sat)) hue-rotate(var(--map-hue)) contrast(var(--map-contrast))}
   /* Keep Leaflet's own controls clear of the view-tab strip along the bottom. */
@@ -4048,7 +4048,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 "use strict";
-// Series 2 was #008300, which fell to 2.8:1 against the lighter grey surfaces
+// Series 2 was #008300, which fell to 2.8:1 against the lighter gray surfaces
 // (validated with the palette checker); #0f9b0f clears 3:1 and leaves the CVD
 // separations intact.
 const PALETTE=["#3987e5","#0f9b0f","#d55181","#c98500","#199e70","#d95926","#9085e9","#e66767"];
@@ -4658,7 +4658,7 @@ document.querySelectorAll(".dseg button").forEach(b=>b.addEventListener("click",
 }));
 
 // ---- Visualizations panel --------------------------------------------------
-// Four questions asked of the same window. Device colour is the SAME colour the
+// Four questions asked of the same window. Device color is the SAME color the
 // device has on the map (colorFor), so identity carries across every view — a
 // filter or a re-sort never repaints a device.
 const vizPanel=document.getElementById("viz");
@@ -4744,7 +4744,7 @@ function renderViz(){
 // --- Constellation: device -> destination, laid out radially so each device
 // owns an angular sector and its destinations fan out inside it.
 // Overview -> drill-down. Showing 10 devices x 8 destinations at once was ~80
-// labelled nodes competing for the same pixels, which is unreadable at any
+// labeled nodes competing for the same pixels, which is unreadable at any
 // size. So the overview labels DEVICES only and draws their destinations as
 // bare dots (shape without the label soup); clicking a device opens a
 // dendrogram of just that device's connections, where every one gets its own
@@ -4791,7 +4791,7 @@ function vizConstOverview(devs,byDev,W,H){
       inner+='<circle cx="'+ex.toFixed(1)+'" cy="'+ey.toFixed(1)+'" r="'+rad.toFixed(1)+
         '" fill="'+(l.threat?"#d03b3b":col)+'" stroke="var(--surface-1)" stroke-width="1.5"/>';
     });
-    // the device itself: labelled, sized, and the thing you click
+    // the device itself: labeled, sized, and the thing you click
     inner+='<circle cx="'+dx.toFixed(1)+'" cy="'+dy.toFixed(1)+'" r="8" fill="'+col+
       '" stroke="var(--surface-1)" stroke-width="2.5"/>';
     if(bad)inner+='<circle cx="'+(dx+7).toFixed(1)+'" cy="'+(dy-7).toFixed(1)+
@@ -5036,7 +5036,7 @@ function vizWeather(w,W){
     html+='<div class="vnote">Only '+filled+" hour"+(filled===1?"":"s")+
       " of history so far — this view gets useful once NetWatch has been running "+
       "for a day or so.</div>";
-  return html+'<div class="vnote">Colour is the volume moved in that hour. A device with a '+
+  return html+'<div class="vnote">Color is the volume moved in that hour. A device with a '+
     "routine makes a visible pattern here — the useful part is when the pattern breaks.</div>";
 }
 
@@ -5210,7 +5210,7 @@ function renderDetail(d){
     +"<dt>Location</dt><dd>"+(g.country?flag(g.countryCode)+" "+esc(g.city?g.city+", ":"")
       +esc(g.region?g.region+", ":"")+esc(g.country):"unknown / not geolocated")+"</dd>"
     +(g.isp?"<dt>ISP</dt><dd>"+esc(g.isp)+"</dd>":"")
-    +(g.org&&g.org!==g.isp?"<dt>Organisation</dt><dd>"+esc(g.org)+"</dd>":"")
+    +(g.org&&g.org!==g.isp?"<dt>Organization</dt><dd>"+esc(g.org)+"</dd>":"")
     +"<dt>Total traffic</dt><dd>&#8593; "+fmtBytes(tot.up||0)+" &nbsp; &#8595; "
       +fmtBytes(tot.down||0)+"</dd>"
     +(tot.first_seen?"<dt>First seen</dt><dd>"+ago(tot.first_seen)+"</dd>":"")
